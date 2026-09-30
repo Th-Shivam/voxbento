@@ -13,32 +13,26 @@ _lock = Lock()
 
 # Keys are keyed on caller-supplied identifiers (email addresses, client IPs), so an
 # unauthenticated caller controls how many exist. Sweeping on a timer keeps the dict
-# proportional to live traffic; the hard cap keeps it bounded even under a flood.
+# proportional to the identifiers seen within one window.
 _SWEEP_INTERVAL_SECONDS = 60.0
-_MAX_TRACKED_KEYS = 10_000
 _last_sweep = 0.0
 
 
-def _evict_expired(store: dict[str, tuple[float, list[float]]], now: float, *, reserve: int = 0) -> None:
-    """Drop entries whose window has fully elapsed, then cap the total size.
+def _evict_expired(store: dict[str, tuple[float, list[float]]], now: float) -> None:
+    """Drop entries whose window has fully elapsed, and only those.
 
     Once every timestamp for a key is older than that key's window, the key can
-    never deny a request again, so retaining it only costs memory. If sweeping
-    alone does not get us under ``_MAX_TRACKED_KEYS`` we evict the
-    least-recently-seen keys as a memory backstop.
+    never deny a request again, so retaining it only costs memory.
 
-    ``reserve`` is the number of keys the caller is about to write, so the cap
-    still holds after the caller's own insert.
+    There is deliberately no size cap. Any cap must evict *live* entries, and
+    evicting a live entry hands that identifier a fresh allowance. That lands
+    hardest on a key which is currently throttled, because a denied request
+    appends no timestamp, so such a key looks stale by any recency measure and
+    is evicted first. Bounding the attacker-controlled dimension belongs in
+    per-IP throttling on the auth routes, not in this helper.
     """
     for key, (window, timestamps) in list(store.items()):
         if not timestamps or now - timestamps[-1] >= window:
-            del store[key]
-
-    overflow = len(store) + reserve - _MAX_TRACKED_KEYS
-    if overflow > 0:
-        # Timestamps are appended in wall-clock order, so [-1] is the most recent hit.
-        stale_first = sorted(store.items(), key=lambda item: item[1][1][-1])
-        for key, _ in stale_first[:overflow]:
             del store[key]
 
 
@@ -54,9 +48,9 @@ def check_rate_limit(action: str, identifier: str, max_requests: int, window_sec
     cutoff = now - window_seconds
 
     with _lock:
-        if now - _last_sweep >= _SWEEP_INTERVAL_SECONDS or len(_rates) >= _MAX_TRACKED_KEYS:
+        if now - _last_sweep >= _SWEEP_INTERVAL_SECONDS:
             _last_sweep = now
-            _evict_expired(_rates, now, reserve=1)
+            _evict_expired(_rates, now)
 
         # Filter out old requests
         timestamps = [ts for ts in _rates.get(key, (window_seconds, []))[1] if ts > cutoff]
@@ -95,9 +89,9 @@ class InMemoryRateLimiter:
         cutoff = now - self.window_seconds
 
         async with self._lock:
-            if now - self._last_sweep >= _SWEEP_INTERVAL_SECONDS or len(self._store) >= _MAX_TRACKED_KEYS:
+            if now - self._last_sweep >= _SWEEP_INTERVAL_SECONDS:
                 self._last_sweep = now
-                _evict_expired(self._store, now, reserve=1)
+                _evict_expired(self._store, now)
 
             # Drop hits that have slid out of the window, so a caller cannot get a
             # second full allowance by straddling a window boundary.

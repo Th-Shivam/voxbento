@@ -146,18 +146,53 @@ class TestCheckRateLimitEviction:
         assert "api_token_provision:1.2.3.4" not in rate_limit._rates
         assert "login:user@example.com" in rate_limit._rates
 
-    def test_key_count_is_capped_under_a_flood_of_identifiers(self, clock, monkeypatch):
-        """An unauthenticated flood of unique identifiers must not exhaust memory.
-
-        /login keys on the submitted email, so the key space is attacker-chosen.
-        """
-        monkeypatch.setattr(rate_limit, "_MAX_TRACKED_KEYS", 100)
-
+    def test_flood_of_identifiers_is_reclaimed_once_windows_elapse(self, clock):
+        """/login keys on the submitted email, so the key space is caller-chosen.
+        Growth must be bounded by the identifiers seen within one window."""
         for i in range(1000):
-            check_rate_limit("login", f"flood{i}@example.com", max_requests=10, window_seconds=3600)
+            check_rate_limit("login", f"flood{i}@example.com", max_requests=10, window_seconds=60)
+        assert len(rate_limit._rates) == 1000
 
-        assert len(rate_limit._rates) <= 100, (
-            f"_rates grew to {len(rate_limit._rates)} keys under a 1000-identifier flood"
+        clock.advance(61)
+        check_rate_limit("login", "next@example.com", max_requests=10, window_seconds=60)
+
+        assert len(rate_limit._rates) == 1, (
+            f"expected the flood to be reclaimed once its windows elapsed, {len(rate_limit._rates)} keys remain"
+        )
+
+    def test_evict_expired_removes_only_expired_entries(self, clock):
+        """The helper must never drop a live entry.
+
+        A size cap has to evict live entries, and evicting a live entry hands
+        that identifier a fresh allowance — worst for a currently throttled key,
+        since a denied request appends no timestamp and so looks stale by any
+        recency measure. This pins the helper to expiry-only eviction.
+        """
+        now = clock.time()
+        store = {
+            "live-just-hit": (3600.0, [now]),
+            "live-near-edge": (3600.0, [now - 3599]),
+            "expired": (60.0, [now - 61]),
+            "expired-empty": (60.0, []),
+        }
+
+        rate_limit._evict_expired(store, now)
+
+        assert set(store) == {"live-just-hit", "live-near-edge"}
+
+    def test_unrelated_traffic_does_not_reset_a_throttled_allowance(self, clock):
+        for _ in range(3):
+            assert check_rate_limit("login", "victim@example.com", max_requests=3, window_seconds=3600) is True
+        assert check_rate_limit("login", "victim@example.com", max_requests=3, window_seconds=3600) is False
+
+        # Heavy unrelated traffic with newer timestamps, across several sweeps.
+        for round_ in range(3):
+            clock.advance(61)
+            for i in range(200):
+                check_rate_limit("login", f"other{round_}-{i}@example.com", max_requests=3, window_seconds=3600)
+
+        assert check_rate_limit("login", "victim@example.com", max_requests=3, window_seconds=3600) is False, (
+            "unrelated traffic must not hand a still-throttled identifier a fresh allowance"
         )
 
 
@@ -250,14 +285,32 @@ class TestInMemoryRateLimiterMemory:
         assert len(limiter._store) == 1, f"expected only the triggering key to remain, got {len(limiter._store)}"
 
     @pytest.mark.anyio
-    async def test_store_is_capped_under_a_flood_of_keys(self, clock, monkeypatch):
-        monkeypatch.setattr(rate_limit, "_MAX_TRACKED_KEYS", 100)
-        limiter = InMemoryRateLimiter(max_requests=10, window_seconds=3600)
-
+    async def test_store_is_reclaimed_once_windows_elapse(self, clock):
+        limiter = InMemoryRateLimiter(max_requests=10, window_seconds=60)
         for i in range(1000):
             await limiter.is_rate_limited(f"ip{i}")
+        assert len(limiter._store) == 1000
 
-        assert len(limiter._store) <= 100, f"_store grew to {len(limiter._store)} keys under a 1000-key flood"
+        clock.advance(61)
+        await limiter.is_rate_limited("next")
+
+        assert len(limiter._store) == 1, f"expected the flood to be reclaimed, {len(limiter._store)} keys remain"
+
+    @pytest.mark.anyio
+    async def test_unrelated_traffic_does_not_reset_a_throttled_key(self, clock):
+        limiter = InMemoryRateLimiter(max_requests=2, window_seconds=3600)
+        assert await limiter.is_rate_limited("victim") is False
+        assert await limiter.is_rate_limited("victim") is False
+        assert await limiter.is_rate_limited("victim") is True
+
+        for round_ in range(3):
+            clock.advance(61)
+            for i in range(200):
+                await limiter.is_rate_limited(f"other{round_}-{i}")
+
+        assert await limiter.is_rate_limited("victim") is True, (
+            "unrelated traffic must not hand a still-throttled key a fresh allowance"
+        )
 
     @pytest.mark.anyio
     async def test_cleanup_drops_expired_keys_and_keeps_live_ones(self, clock):
