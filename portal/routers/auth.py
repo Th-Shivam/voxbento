@@ -300,7 +300,7 @@ async def user_login_submit(request: Request):
 
     password_hash = user.password_hash if user and user.password_hash else _DUMMY_PASSWORD_HASH
     password_valid = verify_password(password, password_hash)
-    if user is None or not password_valid or not user.is_active or not user.email_verified:
+    if user is None or not user.password_hash or not password_valid or not user.is_active or not user.email_verified:
         return templates.TemplateResponse(
             request=request,
             name="login.html",

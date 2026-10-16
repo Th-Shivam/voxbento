@@ -436,6 +436,26 @@ class TestUserLogin:
         assert b"Please verify" not in resp.content
 
     @pytest.mark.anyio
+    async def test_passwordless_account_rejected_even_if_dummy_verification_succeeds(self, setup_db, monkeypatch):
+        import portal.routers.auth as auth_router
+
+        await _create_test_user(email="passwordless-dummy@example.com", password=None)
+        monkeypatch.setattr(auth_router, "verify_password", lambda _password, _password_hash: True)
+
+        async with _client() as c:
+            resp = await c.post(
+                "/login",
+                data={
+                    "email": "passwordless-dummy@example.com",
+                    "password": "any-password",
+                },
+            )
+
+        assert resp.status_code == 403
+        assert b"Invalid email or password" in resp.content
+        assert "user_token" not in resp.headers.get("set-cookie", "")
+
+    @pytest.mark.anyio
     async def test_login_deactivated_user_rejected(self, setup_db):
         from portal.database import get_session, update_user_active
 
