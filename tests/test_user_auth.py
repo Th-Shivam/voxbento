@@ -268,6 +268,45 @@ class TestRegistration:
 
 
 # ---------------------------------------------------------------------------
+# Email discovery privacy
+# ---------------------------------------------------------------------------
+
+
+class TestEmailDiscoveryPrivacy:
+    @pytest.mark.anyio
+    async def test_check_email_has_the_same_neutral_response_for_every_account_state(self, setup_db):
+        await _create_test_user(email="password@example.com", password="securepass123")
+        await _create_test_user(email="passwordless@example.com", password=None)
+
+        async with _client() as c:
+            responses = [
+                await c.post("/api/auth/check-email", json={"email": email})
+                for email in (
+                    "password@example.com",
+                    "passwordless@example.com",
+                    "unknown@example.com",
+                )
+            ]
+
+        assert [response.status_code for response in responses] == [200, 200, 200]
+        assert [response.json() for response in responses] == [
+            {"status": "ok"},
+            {"status": "ok"},
+            {"status": "ok"},
+        ]
+
+    @pytest.mark.anyio
+    async def test_login_page_does_not_branch_on_account_state(self, setup_db):
+        async with _client() as c:
+            response = await c.get("/login")
+
+        assert response.status_code == 200
+        assert b"data.exists" not in response.content
+        assert b"data.has_password" not in response.content
+        assert b'id="register-link"' in response.content
+
+
+# ---------------------------------------------------------------------------
 # Login
 # ---------------------------------------------------------------------------
 

@@ -130,11 +130,10 @@ async def check_email_api(request: Request):
     email = data.get("email", "").strip().lower()
     if not email:
         raise HTTPException(status_code=422, detail="Email required")
-    async with get_session() as session:
-        user = await get_user_by_email(session, email)
-    if user:
-        return {"exists": True, "has_password": user.password_hash is not None}
-    return {"exists": False, "has_password": False}
+    # Do not turn this unauthenticated endpoint into an account-enumeration
+    # oracle. The login page always presents the same authentication options;
+    # password and magic-link endpoints handle the actual account state.
+    return {"status": "ok"}
 
 
 @router.get("/register")
