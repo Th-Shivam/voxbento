@@ -118,8 +118,9 @@ class TestRegistration:
                     "password_confirm": "securepass123",
                 },
             )
-        assert resp.status_code == 422
-        assert b"already exists" in resp.content
+        assert resp.status_code == 200
+        assert b"eligible for registration" in resp.content
+        assert b"already exists" not in resp.content
 
     @pytest.mark.anyio
     async def test_register_rejects_mismatched_password_confirm(self, setup_db):

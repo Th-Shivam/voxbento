@@ -169,7 +169,13 @@ async def register_submit(request: Request):
         async with get_session() as session:
             existing = await get_user_by_email(session, email)
             if existing:
-                errors.append("An account with this email already exists.")
+                # Keep the registration response indistinguishable from a new
+                # registration so this form cannot be used to enumerate users.
+                return templates.TemplateResponse(
+                    request=request,
+                    name="register_success.html",
+                    context={"email": email},
+                )
             else:
                 pw_hash = hash_password(password_raw) if password else None
                 user = await create_user(
