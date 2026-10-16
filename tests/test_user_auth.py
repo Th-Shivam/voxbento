@@ -123,6 +123,60 @@ class TestRegistration:
         assert b"already exists" not in resp.content
 
     @pytest.mark.anyio
+    async def test_duplicate_unverified_registration_refreshes_once(self, setup_db, monkeypatch):
+        from sqlalchemy import select
+
+        import portal.routers.auth as auth_router
+        from portal.database import create_auth_token, create_user, get_session
+        from portal.models import AuthToken
+
+        sent_tokens = []
+
+        async def fake_send_verification_email(email, token):
+            sent_tokens.append((email, token))
+
+        monkeypatch.setattr(auth_router, "send_verification_email", fake_send_verification_email)
+
+        async with get_session() as session:
+            user = await create_user(
+                session,
+                email="unverified-duplicate@example.com",
+                display_name="Unverified",
+                email_verified=False,
+            )
+            await create_auth_token(
+                session,
+                jti="old-verification-token",
+                user_id=user.id,
+                token_type="verification",
+            )
+
+        form = {
+            "email": "unverified-duplicate@example.com",
+            "display_name": "Another Name",
+            "password": "securepass123",
+            "password_confirm": "securepass123",
+        }
+        async with _client() as c:
+            first = await c.post("/register", data=form)
+            second = await c.post("/register", data=form)
+
+        assert first.status_code == second.status_code == 200
+        assert b"eligible for registration" in first.content
+        assert b'href="/login"' in first.content
+        assert len(sent_tokens) == 1
+
+        async with get_session() as session:
+            tokens = list(
+                (await session.execute(select(AuthToken).where(AuthToken.user_id == user.id).order_by(AuthToken.id)))
+                .scalars()
+                .all()
+            )
+        assert len(tokens) == 2
+        assert tokens[0].used_at is not None
+        assert sum(token.used_at is None for token in tokens) == 1
+
+    @pytest.mark.anyio
     async def test_register_rejects_mismatched_password_confirm(self, setup_db):
         from portal.database import get_session, get_user_by_email
 
@@ -291,9 +345,9 @@ class TestEmailDiscoveryPrivacy:
 
         assert [response.status_code for response in responses] == [200, 200, 200]
         assert [response.json() for response in responses] == [
-            {"status": "ok"},
-            {"status": "ok"},
-            {"status": "ok"},
+            {"status": "ok", "exists": True, "has_password": True},
+            {"status": "ok", "exists": True, "has_password": True},
+            {"status": "ok", "exists": True, "has_password": True},
         ]
 
     @pytest.mark.anyio
@@ -305,6 +359,7 @@ class TestEmailDiscoveryPrivacy:
         assert b"data.exists" not in response.content
         assert b"data.has_password" not in response.content
         assert b'id="register-link"' in response.content
+        assert b"/register?email=" not in response.content
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +418,22 @@ class TestUserLogin:
                 },
             )
         assert resp.status_code == 403
+        assert b"Invalid email or password" in resp.content
+
+    @pytest.mark.anyio
+    async def test_login_with_passwordless_account_uses_generic_error(self, setup_db):
+        await _create_test_user(email="passwordless-login@example.com", password=None)
+        async with _client() as c:
+            resp = await c.post(
+                "/login",
+                data={
+                    "email": "passwordless-login@example.com",
+                    "password": "whatever",
+                },
+            )
+        assert resp.status_code == 403
+        assert b"Invalid email or password" in resp.content
+        assert b"Please verify" not in resp.content
 
     @pytest.mark.anyio
     async def test_login_deactivated_user_rejected(self, setup_db):
@@ -380,7 +451,8 @@ class TestUserLogin:
                 },
             )
         assert resp.status_code == 403
-        assert b"deactivated" in resp.content
+        assert b"Invalid email or password" in resp.content
+        assert b"Your account has been deactivated" not in resp.content
 
 
 # ---------------------------------------------------------------------------

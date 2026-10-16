@@ -73,7 +73,6 @@ document.addEventListener("DOMContentLoaded", () => {
   const alertContainer = document.getElementById("alert-container");
   const successContainer = document.getElementById("success-container");
   const forgotPasswordLink = document.getElementById("forgot-password-link");
-  const registerLink = document.getElementById("register-link");
 
   let currentEmail = "";
 
@@ -112,14 +111,12 @@ document.addEventListener("DOMContentLoaded", () => {
         return;
       }
 
-      // Always show the same authentication options. The response deliberately
-      // contains no account-state information, so this flow cannot enumerate
-      // registered email addresses.
+       // Always show the same authentication options. Any legacy response
+       // fields are constant compatibility sentinels, not account state.
       emailForm.classList.add("hidden");
       loginMethods.classList.remove("hidden");
       userEmailDisplay.textContent = currentEmail;
       passEmailInput.value = currentEmail;
-      registerLink.href = `/register?email=${encodeURIComponent(currentEmail)}`;
       passwordForm.classList.remove("hidden");
       magicDivider.classList.remove("hidden");
       document.getElementById("password").focus();

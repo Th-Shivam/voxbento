@@ -856,6 +856,20 @@ async def create_auth_token(
     return tok
 
 
+async def revoke_auth_tokens(session: AsyncSession, *, user_id: int, token_type: str) -> None:
+    """Invalidate all unused auth tokens of a type for a user."""
+    await session.execute(
+        sa.update(AuthToken)
+        .where(
+            AuthToken.user_id == user_id,
+            AuthToken.token_type == token_type,
+            AuthToken.used_at.is_(None),
+        )
+        .values(used_at=datetime.now(tz=timezone.utc))
+    )
+    await session.flush()
+
+
 async def get_auth_token(session: AsyncSession, jti: str) -> AuthToken | None:
     stmt = sa.select(AuthToken).options(sa.orm.joinedload(AuthToken.user)).where(AuthToken.jti == jti)
     result = await session.execute(stmt)
