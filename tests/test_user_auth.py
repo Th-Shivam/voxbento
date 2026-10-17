@@ -134,6 +134,7 @@ class TestRegistration:
 
         async def fake_send_verification_email(email, token):
             sent_tokens.append((email, token))
+            return True
 
         monkeypatch.setattr(auth_router, "send_verification_email", fake_send_verification_email)
 
@@ -173,8 +174,57 @@ class TestRegistration:
                 .all()
             )
         assert len(tokens) == 2
-        assert tokens[0].used_at is not None
-        assert sum(token.used_at is None for token in tokens) == 1
+        assert tokens[0].used_at is None
+        assert sum(token.used_at is None for token in tokens) == 2
+
+    @pytest.mark.anyio
+    async def test_duplicate_registration_preserves_old_token_when_resend_fails(self, setup_db, monkeypatch):
+        from sqlalchemy import select
+
+        import portal.routers.auth as auth_router
+        from portal.database import create_auth_token, create_user, get_session
+        from portal.models import AuthToken
+
+        async def fake_send_verification_email(_email, _token):
+            return False
+
+        monkeypatch.setattr(auth_router, "send_verification_email", fake_send_verification_email)
+
+        async with get_session() as session:
+            user = await create_user(
+                session,
+                email="unverified-delivery-failure@example.com",
+                display_name="Unverified",
+                email_verified=False,
+            )
+            await create_auth_token(
+                session,
+                jti="delivered-verification-token",
+                user_id=user.id,
+                token_type="verification",
+            )
+
+        async with _client() as c:
+            response = await c.post(
+                "/register",
+                data={
+                    "email": "unverified-delivery-failure@example.com",
+                    "display_name": "Another Name",
+                    "password": "securepass123",
+                    "password_confirm": "securepass123",
+                },
+            )
+
+        assert response.status_code == 200
+        async with get_session() as session:
+            tokens = list(
+                (await session.execute(select(AuthToken).where(AuthToken.user_id == user.id).order_by(AuthToken.id)))
+                .scalars()
+                .all()
+            )
+        assert len(tokens) == 2
+        assert tokens[0].used_at is None
+        assert tokens[1].used_at is not None
 
     @pytest.mark.anyio
     async def test_register_rejects_mismatched_password_confirm(self, setup_db):
@@ -473,6 +523,55 @@ class TestUserLogin:
         assert resp.status_code == 403
         assert b"Invalid email or password" in resp.content
         assert b"Your account has been deactivated" not in resp.content
+
+    @pytest.mark.anyio
+    async def test_deactivated_user_cookie_is_not_authenticated(self, setup_db):
+        from portal.database import get_session, update_user_active
+
+        user = await _create_test_user(email="stale-cookie@example.com")
+        token = create_user_token(user_id=user.id, email=user.email, is_admin=user.is_admin)
+        async with get_session() as session:
+            await update_user_active(session, user.id, is_active=False)
+
+        async with _client() as c:
+            response = await c.get("/api/auth/status", cookies={"user_token": token})
+
+        assert response.status_code == 200
+        assert response.json() == {"authenticated": False}
+
+
+class TestEmailVerification:
+    @pytest.mark.anyio
+    async def test_inactive_user_cannot_verify_or_receive_a_session(self, setup_db):
+        from portal.database import create_auth_token, create_user, get_auth_token, get_session, get_user_by_email
+
+        async with get_session() as session:
+            user = await create_user(
+                session,
+                email="inactive-unverified@example.com",
+                display_name="Inactive",
+                email_verified=False,
+                is_active=False,
+            )
+            await create_auth_token(
+                session,
+                jti="inactive-verification-token",
+                user_id=user.id,
+                token_type="verification",
+            )
+
+        async with _client() as c:
+            response = await c.get("/auth/verify/inactive-verification-token", follow_redirects=False)
+
+        assert response.status_code == 400
+        assert "user_token" not in response.headers.get("set-cookie", "")
+        async with get_session() as session:
+            user_after = await get_user_by_email(session, "inactive-unverified@example.com")
+            token_after = await get_auth_token(session, "inactive-verification-token")
+        assert user_after is not None
+        assert user_after.email_verified is False
+        assert token_after is not None
+        assert token_after.is_used is False
 
 
 # ---------------------------------------------------------------------------

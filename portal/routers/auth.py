@@ -33,6 +33,7 @@ from portal.database import (
     list_room_memberships_for_user,
     redeem_auth_token,
     redeem_invite_token,
+    revoke_auth_token,
     revoke_auth_tokens,
     update_user,
 )
@@ -59,12 +60,36 @@ async def _queue_verification_email(
     background_tasks: BackgroundTasks,
     email: str,
     user_id: int,
+    *,
+    revoke_existing: bool,
 ) -> None:
     """Create a verification token and defer email delivery until after the response."""
-    await revoke_auth_tokens(session, user_id=user_id, token_type="verification")
+    if revoke_existing:
+        await revoke_auth_tokens(session, user_id=user_id, token_type="verification")
     token_val = secrets.token_hex(32)
     await create_auth_token(session, jti=token_val, user_id=user_id, token_type="verification")  # nosec B105
-    background_tasks.add_task(send_verification_email, email, token_val)
+    background_tasks.add_task(
+        _deliver_verification_email,
+        email,
+        token_val,
+        user_id,
+        revoke_existing,
+    )
+
+
+async def _deliver_verification_email(email: str, token: str, user_id: int, revoke_existing: bool) -> None:
+    """Deliver a verification email and finalize token replacement after delivery."""
+    delivered = await send_verification_email(email, token)
+    async with get_session() as session:
+        if delivered and revoke_existing:
+            await revoke_auth_tokens(
+                session,
+                user_id=user_id,
+                token_type="verification",
+                exclude_jti=token,
+            )
+        elif not delivered:
+            await revoke_auth_token(session, jti=token)
 
 
 def _registration_success(request: Request, email: str) -> object:
@@ -207,7 +232,14 @@ async def register_submit(request: Request, background_tasks: BackgroundTasks):
                 if not existing.email_verified and check_rate_limit(
                     "verification_email", email, max_requests=1, window_seconds=900
                 ):
-                    await _queue_verification_email(session, background_tasks, email, existing.id)
+                    if existing.is_active:
+                        await _queue_verification_email(
+                            session,
+                            background_tasks,
+                            email,
+                            existing.id,
+                            revoke_existing=False,
+                        )
                 return _registration_success(request, email)
 
             try:
@@ -229,10 +261,17 @@ async def register_submit(request: Request, background_tasks: BackgroundTasks):
                 if not existing.email_verified and check_rate_limit(
                     "verification_email", email, max_requests=1, window_seconds=900
                 ):
-                    await _queue_verification_email(session, background_tasks, email, existing.id)
+                    if existing.is_active:
+                        await _queue_verification_email(
+                            session,
+                            background_tasks,
+                            email,
+                            existing.id,
+                            revoke_existing=False,
+                        )
                 return _registration_success(request, email)
 
-            await _queue_verification_email(session, background_tasks, email, user.id)
+            await _queue_verification_email(session, background_tasks, email, user.id, revoke_existing=True)
             return _registration_success(request, email)
 
     return templates.TemplateResponse(
@@ -248,6 +287,9 @@ async def verify_email_route(request: Request, token: str, background_tasks: Bac
     async with get_session() as session:
         try:
             auth_token = await redeem_auth_token(session, token, "verification")
+            user = await get_user_by_id(session, auth_token.user_id)
+            if user is None or not user.is_active:
+                raise ValueError("Invalid verification link.")
             user = await update_user(session, auth_token.user_id, email_verified=True)
             background_tasks.add_task(send_delayed_onboarding_email, user.email, user.display_name)
 
