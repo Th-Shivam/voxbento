@@ -178,6 +178,59 @@ class TestRegistration:
         assert sum(token.used_at is None for token in tokens) == 2
 
     @pytest.mark.anyio
+    async def test_duplicate_registration_cannot_activate_preexisting_password(self, setup_db, monkeypatch):
+        import portal.routers.auth as auth_router
+        from portal.database import create_user, get_session, get_user_by_email
+
+        sent_tokens = []
+
+        async def fake_send_delayed_onboarding_email(_email, _display_name):
+            return None
+
+        async def fake_send_verification_email(_email, token):
+            sent_tokens.append(token)
+            return True
+
+        monkeypatch.setattr(auth_router, "send_verification_email", fake_send_verification_email)
+        monkeypatch.setattr(auth_router, "send_delayed_onboarding_email", fake_send_delayed_onboarding_email)
+
+        async with get_session() as session:
+            await create_user(
+                session,
+                email="preclaimed@example.com",
+                display_name="Earlier registrant",
+                password_hash=hash_password("attacker-password"),
+                email_verified=False,
+                is_active=True,
+            )
+
+        async with _client() as c:
+            registration = await c.post(
+                "/register",
+                data={
+                    "email": "preclaimed@example.com",
+                    "display_name": "Email owner",
+                    "password": "owner-password",
+                    "password_confirm": "owner-password",
+                },
+            )
+            verification = await c.get(f"/auth/verify/{sent_tokens[0]}", follow_redirects=False)
+            login = await c.post(
+                "/login",
+                data={"email": "preclaimed@example.com", "password": "attacker-password"},
+            )
+
+        assert registration.status_code == 200
+        assert verification.status_code == 303
+        assert login.status_code == 403
+
+        async with get_session() as session:
+            user = await get_user_by_email(session, "preclaimed@example.com")
+        assert user is not None
+        assert user.email_verified is True
+        assert user.password_hash is None
+
+    @pytest.mark.anyio
     async def test_duplicate_registration_preserves_old_token_when_resend_fails(self, setup_db, monkeypatch):
         from sqlalchemy import select
 

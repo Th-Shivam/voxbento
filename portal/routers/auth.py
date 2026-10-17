@@ -250,6 +250,12 @@ async def register_submit(request: Request, background_tasks: BackgroundTasks):
                     "verification_email", email, max_requests=1, window_seconds=900
                 ):
                     if existing.is_active:
+                        # A password on an unverified account may have been
+                        # chosen by an earlier registrant. Do not let email
+                        # verification activate those credentials; the owner
+                        # can use the resulting magic-link session to set a
+                        # new password.
+                        existing.password_hash = None
                         await _queue_verification_email(
                             session,
                             background_tasks,
@@ -279,6 +285,7 @@ async def register_submit(request: Request, background_tasks: BackgroundTasks):
                     "verification_email", email, max_requests=1, window_seconds=900
                 ):
                     if existing.is_active:
+                        existing.password_hash = None
                         await _queue_verification_email(
                             session,
                             background_tasks,
