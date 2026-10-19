@@ -125,7 +125,7 @@ async def get_event(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    await _verify_token_rbac(db, token, event)
+    await _verify_token_rbac(db, token, event, lock_event=True)
 
     return {
         "id": event.id,
@@ -147,7 +147,7 @@ async def get_rooms(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    await _verify_token_rbac(db, token, event)
+    await _verify_token_rbac(db, token, event, lock_event=True)
 
     room_result = await db.execute(select(Room).where(Room.event_id == event.id))
     rooms = room_result.scalars().all()
@@ -659,7 +659,7 @@ async def list_booths(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    await _verify_token_rbac(db, token, event, room_id)
+    await _verify_token_rbac(db, token, event, room_id, lock_event=True)
 
     result = await db.execute(select(DBBooth).where(DBBooth.room_id == room_id, DBBooth.event_id == event.id))
     booths_list = result.scalars().all()
@@ -688,7 +688,7 @@ async def get_booth(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    await _verify_token_rbac(db, token, event, room_id)
+    await _verify_token_rbac(db, token, event, room_id, lock_event=True)
 
     result = await db.execute(select(DBBooth).where(DBBooth.room_id == room_id, DBBooth.language_code == language_code, DBBooth.event_id == event.id))
     booth = result.scalars().first()
@@ -817,7 +817,7 @@ async def get_transcription_status(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    await _verify_token_rbac(db, token, event, room_id)
+    await _verify_token_rbac(db, token, event, room_id, lock_event=True)
 
     # Collect statuses for all booths in the room
     result = await db.execute(select(DBBooth).where(DBBooth.room_id == room_id, DBBooth.event_id == event.id))
@@ -849,7 +849,7 @@ async def export_transcript(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    await _verify_token_rbac(db, token, event, room_id)
+    await _verify_token_rbac(db, token, event, room_id, lock_event=True)
 
     return {"status": "success", "content": "Transcription export not fully implemented"}
 
