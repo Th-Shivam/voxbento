@@ -83,6 +83,40 @@ async def seed_data():
 
 class TestApiV1IDOR:
     @pytest.mark.anyio
+    async def test_deleted_event_cannot_create_booth(self, seed_data):
+        event_a, room_a, *_rest, token_a = seed_data
+
+        from sqlalchemy import select
+
+        from portal.database import get_session
+        from portal.models import DBBooth
+
+        async with _client() as c:
+            delete_response = await c.delete(
+                f"/api/v1/events/{event_a.slug}",
+                headers={"Authorization": f"Bearer {token_a}"},
+            )
+            assert delete_response.status_code == 204
+
+            create_response = await c.post(
+                f"/api/v1/events/{event_a.slug}/rooms/{room_a.id}/booths/de",
+                headers={"Authorization": f"Bearer {token_a}"},
+            )
+
+        assert create_response.status_code == 404
+        assert create_response.json()["detail"] == "Event not found"
+
+        async with get_session() as session:
+            result = await session.execute(
+                select(DBBooth).where(
+                    DBBooth.event_id == event_a.id,
+                    DBBooth.room_id == room_a.id,
+                    DBBooth.language_code == "de",
+                )
+            )
+            assert result.scalars().first() is None
+
+    @pytest.mark.anyio
     async def test_room_id_cross_tenant_returns_404(self, seed_data):
         event_a, room_a, booth_a, event_b, room_b, booth_b, rogue_booth, token_a = seed_data
 
