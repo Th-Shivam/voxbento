@@ -5,9 +5,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -15,6 +17,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from portal import meeting_source, program_ingest
 from portal.auth import require_admin
 from portal.config import settings
+from portal.exceptions import RedirectRequired
 from portal.routers.admin import router as admin_router
 from portal.routers.api import router as api_router
 from portal.routers.api_v1 import router as api_v1_router
@@ -140,6 +143,40 @@ async def get_open_api_endpoint(request: Request, _=Depends(require_admin)):
     return JSONResponse(get_openapi(title="Voxbento API", version="1.0.0", routes=app.routes))
 
 
+@app.exception_handler(RedirectRequired)
+async def redirect_required_handler(request: Request, exc: RedirectRequired):
+    return RedirectResponse(exc.url, status_code=exc.status_code)
+
+
+# Write-only secrets (e.g. the YouTube relay key) must never be echoed back by a 422.
+_REDACTED_INPUT_FIELDS = frozenset({"stream_key"})
+
+
+def _contains_secret_field(value: object) -> bool:
+    if isinstance(value, dict):
+        return any(key in _REDACTED_INPUT_FIELDS or _contains_secret_field(item) for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_secret_field(item) for item in value)
+    return False
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
+    """FastAPI's default 422, minus the rejected input wherever it is or contains a secret field.
+
+    A ``missing`` error reports the whole body as its input, so the check covers the value
+    as well as the error location.
+    """
+    errors = []
+    for error in exc.errors():
+        if any(part in _REDACTED_INPUT_FIELDS for part in error.get("loc", ())) or _contains_secret_field(
+            error.get("input")
+        ):
+            error = {key: value for key, value in error.items() if key != "input"}
+        errors.append(error)
+    return JSONResponse({"detail": jsonable_encoder(errors)}, status_code=422)
+
+
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     headers = dict(exc.headers) if exc.headers else None
@@ -152,6 +189,11 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
 
     is_api = "/api/" in request.url.path or request.url.path.startswith("/api")
     if "text/html" in request.headers.get("accept", "") and not is_api:
+        detail_msg = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+        if exc.status_code == 400:
+            return templates.TemplateResponse(
+                request, "400.html", {"request": request, "detail": detail_msg, "status_code": 400}, status_code=400
+            )
         if exc.status_code in (401, 403):
             import urllib.parse
 
@@ -170,20 +212,23 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
                         f"/login?next={urllib.parse.quote(next_url)}", status_code=status.HTTP_303_SEE_OTHER
                     )
             return templates.TemplateResponse(
-                request, "403.html", {"request": request, "detail": exc.detail}, status_code=403
+                request, "403.html", {"request": request, "detail": detail_msg}, status_code=403
             )
         if exc.status_code == 404:
             return templates.TemplateResponse(
-                request, "404.html", {"request": request, "detail": exc.detail}, status_code=404
+                request, "404.html", {"request": request, "detail": detail_msg}, status_code=404
             )
         if exc.status_code == 429:
             return templates.TemplateResponse(
-                request, "429.html", {"request": request, "detail": exc.detail}, status_code=429
+                request, "429.html", {"request": request, "detail": detail_msg}, status_code=429
             )
         if exc.status_code >= 500:
             return templates.TemplateResponse(
-                request, "500.html", {"request": request, "detail": exc.detail}, status_code=exc.status_code
+                request, "500.html", {"request": request, "detail": detail_msg}, status_code=exc.status_code
             )
+        return templates.TemplateResponse(
+            request, "400.html", {"request": request, "detail": detail_msg, "status_code": exc.status_code}, status_code=exc.status_code
+        )
     return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=headers)
 
 

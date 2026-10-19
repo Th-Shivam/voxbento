@@ -39,10 +39,10 @@ async def _send_email_async(
 ) -> bool:
     if not _mail_config:
         logger.warning(
-            "SMTP is not configured. Would have sent email to %s (subject: %s) with context %r",
+            "SMTP is not configured. Would have sent email to %s (subject: %s, template: %s)",
             email_to,
             subject,
-            template_body,
+            template_name,
         )
         return True
 
@@ -61,9 +61,9 @@ async def _send_email_async(
         return False
 
 
-async def send_verification_email(email_to: str, token: str) -> None:
+async def send_verification_email(email_to: str, token: str) -> bool:
     verification_link = f"{settings.public_base_url}/auth/verify/{token}"
-    await _send_email_async(
+    return await _send_email_async(
         email_to=email_to,
         subject="Verify your VoxBento account",
         template_name="verification.html",
@@ -102,5 +102,28 @@ async def send_role_invite_email(email_to: str, invite_url: str, role_name: str,
             "role_name": role_name,
             "context_name": context_name,
             "invite_url": invite_url,
+        },
+    )
+
+
+async def send_hosting_invite_email(email_to: str, invite_url: str, is_existing_user: bool = False) -> None:
+    await _send_email_async(
+        email_to=email_to,
+        subject="You've been invited to host events on VoxBento",
+        template_name="hosting_invite.html",
+        template_body={
+            "invite_url": invite_url,
+            "is_existing_user": is_existing_user,
+        },
+    )
+
+
+async def send_hosting_granted_email(email_to: str, login_url: str) -> None:
+    await _send_email_async(
+        email_to=email_to,
+        subject="Hosting access granted on VoxBento",
+        template_name="hosting_granted.html",
+        template_body={
+            "login_url": login_url,
         },
     )
