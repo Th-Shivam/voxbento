@@ -48,9 +48,24 @@ _API_KEY_FIELDS: list[tuple[str, str]] = [
 ]
 
 
-async def _verify_token_rbac(db: AsyncSession, token: OAuthToken, event: Event, room_id: int | None = None) -> None:
-    """Ensure the OAuth token is valid for this event, AND the underlying user still has RBAC permissions."""
-    if event.deleted_at is not None:
+async def _verify_token_rbac(
+    db: AsyncSession,
+    token: OAuthToken,
+    event: Event,
+    room_id: int | None = None,
+    lock_event: bool = False,
+) -> None:
+    """Validate OAuth RBAC and optionally lock the event for a mutating request."""
+    if lock_event:
+        result = await db.execute(
+            select(Event)
+            .where(Event.id == event.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        event = result.scalars().first()
+
+    if event is None or event.deleted_at is not None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
 
     if token.event_id != event.id:
@@ -240,6 +255,7 @@ async def create_event(
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("events:write")),
 ):
+    """Create an event or update an existing active event's memberships."""
     client_ip = request.client.host if request.client else "unknown"
     if await auth_rate_limiter.is_rate_limited(f"create_event_{client_ip}"):
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Too many requests")
@@ -251,10 +267,18 @@ async def create_event(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    result = await db.execute(select(Event).where(Event.slug == slug))
+    result = await db.execute(
+        select(Event)
+        .where(Event.slug == slug)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
     existing_event = result.scalars().first()
 
     if existing_event:
+        if existing_event.deleted_at is not None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
+
         # Verify caller is authorized to modify memberships on this existing event
         is_authorized = False
         if token.event_id == existing_event.id:
@@ -279,19 +303,13 @@ async def create_event(
         if not is_authorized:
             raise HTTPException(status_code=403, detail="Not authorized to manage memberships for this event.")
 
-        if existing_event.deleted_at is None:
-            # Update the display name if the event already exists (e.g. from OAuth auto-provisioning)
-            if existing_event.display_name != payload.name:
-                existing_event.display_name = payload.name
-                db.add(existing_event)
-                await db.flush()
-            await _ensure_event_memberships(db, existing_event.id, token.user_id, payload.organizer_emails)
-            return {"id": existing_event.id, "slug": existing_event.slug, "name": existing_event.display_name}
-        existing_event.deleted_at = None
-        existing_event.display_name = payload.name
-        event = existing_event
-        action = "event.restored"
-        status_code_ret = status.HTTP_200_OK
+        # Update the display name if the event already exists (e.g. from OAuth auto-provisioning)
+        if existing_event.display_name != payload.name:
+            existing_event.display_name = payload.name
+            db.add(existing_event)
+            await db.flush()
+        await _ensure_event_memberships(db, existing_event.id, token.user_id, payload.organizer_emails)
+        return {"id": existing_event.id, "slug": existing_event.slug, "name": existing_event.display_name}
     else:
         event = Event(slug=slug, display_name=payload.name)
         db.add(event)
@@ -336,7 +354,7 @@ async def delete_event(
     if not event:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
 
-    await _verify_token_rbac(db, token, event)
+    await _verify_token_rbac(db, token, event, lock_event=True)
 
     active_booths = await booths.list_booths_for_event(event_slug)
     has_active_session = any(b.get("ingest_status") == "connected" for b in active_booths)
@@ -426,7 +444,7 @@ async def upsert_room(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    await _verify_token_rbac(db, token, event)
+    await _verify_token_rbac(db, token, event, lock_event=True)
 
     room_res = await db.execute(
         select(Room).where(Room.event_id == event.id, Room.eventyay_room_id == eventyay_room_id)
@@ -579,7 +597,7 @@ async def delete_room(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    await _verify_token_rbac(db, token, event)
+    await _verify_token_rbac(db, token, event, lock_event=True)
 
     room_res = await db.execute(
         select(Room).where(Room.event_id == event.id, Room.eventyay_room_id == eventyay_room_id)
@@ -625,7 +643,7 @@ async def patch_room_settings(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    await _verify_token_rbac(db, token, event, room_id)
+    await _verify_token_rbac(db, token, event, room_id, lock_event=True)
     return {"status": "success"}
 
 
@@ -698,7 +716,7 @@ async def create_booth(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    await _verify_token_rbac(db, token, event, room_id)
+    await _verify_token_rbac(db, token, event, room_id, lock_event=True)
 
     result = await db.execute(select(DBBooth).where(DBBooth.room_id == room_id, DBBooth.language_code == language_code))
     if result.scalars().first():
@@ -727,7 +745,7 @@ async def delete_booth_endpoint(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    await _verify_token_rbac(db, token, event, room_id)
+    await _verify_token_rbac(db, token, event, room_id, lock_event=True)
 
     result = await db.execute(select(DBBooth).where(DBBooth.room_id == room_id, DBBooth.language_code == language_code, DBBooth.event_id == event.id))
     booth = result.scalars().first()
@@ -753,7 +771,7 @@ async def start_transcription(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    await _verify_token_rbac(db, token, event, room_id)
+    await _verify_token_rbac(db, token, event, room_id, lock_event=True)
 
     booth_id = make_booth_id(event_slug, language_code)
 
@@ -780,7 +798,7 @@ async def stop_transcription(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    await _verify_token_rbac(db, token, event, room_id)
+    await _verify_token_rbac(db, token, event, room_id, lock_event=True)
 
     booth_id = make_booth_id(event_slug, room_id, language_code)
     await stop_transcription_worker(booth_id)
@@ -848,7 +866,7 @@ async def provision_listener_token(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    await _verify_token_rbac(db, token, event, room_id)
+    await _verify_token_rbac(db, token, event, room_id, lock_event=True)
 
     from portal.auth import create_listener_token
 
@@ -889,7 +907,7 @@ async def update_event_api_keys(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    await _verify_token_rbac(db, token, event)
+    await _verify_token_rbac(db, token, event, lock_event=True)
 
     payload_data = payload.model_dump()
     for payload_field, event_attr in _API_KEY_FIELDS:
