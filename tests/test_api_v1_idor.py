@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 from datetime import datetime, timedelta, timezone
@@ -182,6 +183,86 @@ class TestApiV1IDOR:
 
         assert exc_info.value.status_code == 404
         assert exc_info.value.detail == "Event not found"
+
+    @pytest.mark.anyio
+    async def test_sqlite_mutation_lock_serializes_event_deletion(self, tmp_path):
+        """SQLite mutation authorization holds its write lock until the request ends."""
+        from portal.database import configure, create_event, create_room, create_user, dispose, get_session, init_db
+        from portal.models import DeveloperAccount, Event, EventMembership, OAuthClient, OAuthToken
+        from portal.routers.api_v1 import _verify_token_rbac
+
+        await dispose()
+        configure(f"sqlite+aiosqlite:///{tmp_path / 'api-v1-lock.db'}")
+        await init_db()
+
+        from portal.auth import hash_password
+
+        async with get_session() as session:
+            user = await create_user(
+                session,
+                email="sqlite-lock@example.com",
+                display_name="SQLite Lock",
+                password_hash=hash_password("pw"),
+            )
+            event = await create_event(session, slug="sqlite-lock-event", display_name="SQLite Lock Event")
+            room = await create_room(session, event_id=event.id, display_name="Room")
+            session.add(EventMembership(user_id=user.id, event_id=event.id, role="event_owner"))
+            developer = DeveloperAccount(user_id=user.id)
+            session.add(developer)
+            await session.flush()
+            client = OAuthClient(
+                developer_account_id=developer.id,
+                name="SQLite Lock App",
+                client_id="sqlite-lock-client",
+                client_secret_hash="hash",
+            )
+            session.add(client)
+            await session.flush()
+            token = OAuthToken(
+                client_id=client.id,
+                user_id=user.id,
+                event_id=event.id,
+                access_token_hash="hash",
+                scopes=["booths:write", "events:write"],
+                expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+            )
+            session.add(token)
+            await session.flush()
+            event_id, room_id, token_id = event.id, room.id, token.id
+
+        async def delete_event_after_lock():
+            async with get_session() as session:
+                event_to_delete = await session.get(Event, event_id)
+                token_for_delete = await session.get(OAuthToken, token_id)
+                await _verify_token_rbac(
+                    session,
+                    token_for_delete,
+                    event_to_delete,
+                    manage=True,
+                    lock_event=True,
+                    write_lock=True,
+                )
+                event_to_delete.deleted_at = datetime.now(timezone.utc)
+                await session.flush()
+
+        async with get_session() as mutation_session:
+            event_for_mutation = await mutation_session.get(Event, event_id)
+            token_for_mutation = await mutation_session.get(OAuthToken, token_id)
+            await _verify_token_rbac(
+                mutation_session,
+                token_for_mutation,
+                event_for_mutation,
+                room_id,
+                manage=True,
+                lock_event=True,
+                write_lock=True,
+            )
+
+            deletion_task = asyncio.create_task(delete_event_after_lock())
+            await asyncio.sleep(0.1)
+            assert not deletion_task.done()
+
+        await asyncio.wait_for(deletion_task, timeout=5)
 
     @pytest.mark.anyio
     async def test_room_id_cross_tenant_returns_404(self, seed_data):
