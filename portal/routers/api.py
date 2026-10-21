@@ -1,11 +1,22 @@
 from __future__ import annotations
 
+import jwt as pyjwt
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.exc import ObjectDeletedError, StaleDataError
 
-from portal.auth import create_embed_token, create_listener_token, security
+from portal.auth import (
+    coordinates_room,
+    create_embed_token,
+    create_listener_token,
+    decode_token,
+    get_booth_session,
+    load_membership_scope,
+    security,
+)
 from portal.booth_identity import make_booth_id, make_mediamtx_path, validate_event_slug, validate_language_code
 from portal.config import settings
 from portal.database import (
@@ -13,6 +24,7 @@ from portal.database import (
     delete_booth,
     get_event_by_slug,
     get_session,
+    get_user_by_id,
     list_rooms_for_event,
     log_usage_metric,
     verify_api_key,
@@ -20,6 +32,7 @@ from portal.database import (
 from portal.globals import booths
 from portal.models import DBBooth, Event, Room
 from portal.rate_limit import check_rate_limit
+from portal.roles import INTERPRETER
 from portal.schemas.booth import CreateBoothRequest
 from portal.transcription import ProviderConfig, ProviderEnum, get_api_key
 from portal.transcription.worker import start_transcription_worker, stop_transcription_worker
@@ -28,6 +41,200 @@ from portal.websockets.manager import broadcast_transcription
 
 router = APIRouter(prefix="/api")
 bearer_scheme = HTTPBearer(auto_error=False)
+
+
+async def _verify_event_access(
+    session: AsyncSession,
+    request: Request,
+    event_id: int | None,
+    *,
+    room_id: int | None = None,
+    credentials: HTTPAuthorizationCredentials | None = None,
+    token: str = "",
+    require_booth_management: bool = False,
+) -> dict | None:
+    """Authorize a legacy API operation against its event and optional room."""
+    if credentials is None and request.headers.get("authorization"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid auth token.")
+    configured_token = settings.booth_access_token
+    if configured_token and (
+        (credentials is not None and credentials.credentials == configured_token) or token == configured_token
+    ):
+        return
+
+    user_token = request.cookies.get("user_token", "")
+    if credentials is not None and credentials.credentials != configured_token:
+        user_token = credentials.credentials
+
+    if user_token:
+        try:
+            payload = decode_token(user_token)
+        except pyjwt.InvalidTokenError:
+            if credentials is not None and credentials.scheme.lower() == "bearer":
+                api_key = await verify_api_key(session, credentials.credentials)
+                if api_key is not None and event_id is not None and api_key.event_id == event_id:
+                    return
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid auth token.")
+        if payload.get("purpose") == "legacy_api" and configured_token:
+            return
+        if not payload.get("user"):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Participant tokens cannot use this API.")
+
+        try:
+            user_id = int(payload.get("sub", ""))
+        except (TypeError, ValueError):
+            user_id = 0
+        user = await get_user_by_id(session, user_id)
+        if user is None or not user.is_active:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid or inactive user.")
+        if user.is_admin:
+            return
+
+        if event_id is not None:
+            scope = await load_membership_scope(session, user.id)
+            if event_id in scope["owned_event_ids"]:
+                return
+            # Room coordinators may be given per event, room or booth (#757).
+            if room_id is not None and not require_booth_management:
+                room = await session.get(Room, room_id)
+                if room is not None and room.event_id == event_id and coordinates_room(scope, room_id, event_id):
+                    return
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Event access required.")
+
+    if not configured_token and settings.debug:
+        return
+    if not configured_token:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="BOOTH_ACCESS_TOKEN is not configured on this server.",
+        )
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid or missing auth token.")
+
+
+def _verify_participant_scope(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None,
+    *,
+    event_slug: str,
+    room_id: int,
+    language_code: str,
+    session_payload: dict | None = None,
+) -> None:
+    """Prevent a participant JWT from being replayed against another booth."""
+    payload = None
+    if credentials is not None and credentials.credentials != settings.booth_access_token:
+        try:
+            payload = decode_token(credentials.credentials)
+        except pyjwt.InvalidTokenError:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid auth token.")
+    if payload is None:
+        payload = session_payload if session_payload is not None else get_booth_session(request)
+    if not payload or payload.get("user") or payload.get("purpose") == "legacy_api":
+        return
+    if payload.get("event_slug") != event_slug:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Booth event access required.")
+    if payload.get("room_id") is None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid booth scope.")
+    try:
+        participant_room_id = int(payload["room_id"])
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid booth scope.")
+    if participant_room_id != room_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Booth room access required.")
+    if payload.get("language_code") and payload["language_code"] != language_code:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Booth language access required.")
+
+
+async def _verify_resource_access(
+    session: AsyncSession,
+    request: Request,
+    event: Event,
+    *,
+    room_id: int,
+    language_code: str,
+    credentials: HTTPAuthorizationCredentials | None,
+    token: str,
+    require_booth_management: bool = False,
+) -> dict | None:
+    """Apply user membership checks while retaining scoped participant access."""
+    if credentials is None and request.headers.get("authorization"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid auth token.")
+    payload = None
+    is_global_credential = bool(
+        settings.booth_access_token
+        and (
+            (credentials is not None and credentials.credentials == settings.booth_access_token)
+            or token == settings.booth_access_token
+        )
+    )
+    if credentials is not None and not is_global_credential:
+        try:
+            payload = decode_token(credentials.credentials)
+        except pyjwt.InvalidTokenError:
+            # Let the event-scoped verifier distinguish a valid API key from
+            # an invalid bearer; never fall back to a cookie for the latter.
+            await _verify_event_access(
+                session,
+                request,
+                event.id,
+                room_id=room_id,
+                credentials=credentials,
+                token=token,
+                require_booth_management=require_booth_management,
+            )
+            return None
+    if payload is None and not is_global_credential:
+        payload = get_booth_session(request)
+    if credentials is None and payload and payload.get("user") and request.cookies.get("session_token"):
+        try:
+            await _verify_event_access(session, request, event.id, room_id=room_id)
+        except HTTPException:
+            try:
+                participant_payload = decode_token(request.cookies["session_token"])
+            except pyjwt.InvalidTokenError:
+                raise
+            if participant_payload.get("user"):
+                raise
+            payload = participant_payload
+        else:
+            return payload
+    if credentials is None and payload and not payload.get("user") and request.cookies.get("user_token"):
+        try:
+            await _verify_event_access(session, request, event.id, room_id=room_id)
+        except HTTPException:
+            # A user cookie without membership must not prevent a valid,
+            # independently scoped participant session from being used.
+            pass
+        else:
+            return payload
+    if payload and payload.get("user") and not (settings.debug and payload.get("is_admin")):
+        await _verify_event_access(
+            session,
+            request,
+            event.id,
+            room_id=room_id,
+            credentials=credentials,
+            token=token,
+            require_booth_management=require_booth_management,
+        )
+    elif credentials is not None and payload is None:
+        # A bearer API key is not a JWT. Resolve it through the event-scoped
+        # authorization path instead of falling through to the generic gate.
+        await _verify_event_access(
+            session, request, event.id, room_id=room_id, credentials=credentials, token=token
+        )
+    else:
+        _require_access(request, credentials, token, session_payload=payload)
+    if not is_global_credential:
+        _verify_participant_scope(
+            request,
+            credentials,
+            event_slug=event.slug,
+            room_id=room_id,
+            language_code=language_code,
+            session_payload=payload,
+        )
+    return payload
 
 
 @router.post("/v1/tokens/listener", status_code=status.HTTP_201_CREATED)
@@ -73,13 +280,21 @@ async def delete_booth_by_language(
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
 ):
     """Delete a booth from an event."""
-    _require_access(request, credentials, token)
-
     booth_id = make_booth_id(event_slug, room_id, language_code)
-    await stop_transcription_worker(booth_id)
-
-    # Delete from DB
+    room_db_id = room_id
     async with get_session() as session:
+        event = await session.scalar(select(Event).where(Event.slug == event_slug, Event.deleted_at.is_(None)))
+        if not event:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
+        await _verify_event_access(
+            session,
+            request,
+            event.id,
+            room_id=room_id,
+            credentials=credentials,
+            token=token,
+            require_booth_management=True,
+        )
         stmt = (
             select(DBBooth)
             .join(Event)
@@ -87,10 +302,16 @@ async def delete_booth_by_language(
         )
         db_booth = await session.scalar(stmt)
         if db_booth:
-            await delete_booth(session, db_booth.id)
+            try:
+                async with session.begin_nested():
+                    await delete_booth(session, db_booth.id)
+            except (StaleDataError, ObjectDeletedError):
+                pass
 
-    # Remove from in memory state
-    await booths.remove_booth(event_slug, room_id, language_code)
+    try:
+        await stop_transcription_worker(booth_id)
+    finally:
+        await booths.remove_booth(event_slug, room_db_id, language_code)
 
 
 @router.post("/events/{event_slug}/booths", status_code=status.HTTP_201_CREATED)
@@ -106,13 +327,15 @@ async def create_event_booth(
     Returns the booth state including derived booth_id, MediaMTX path,
     WHIP URL, and WHEP URL.
     """
-    _require_access(request, credentials, token)
-
     async with get_session() as session:
         # Get or Create Event
-        event_query = await session.execute(select(Event).where(Event.slug == event_slug))
+        event_query = await session.execute(select(Event).where(Event.slug == event_slug, Event.deleted_at.is_(None)))
         event = event_query.scalar_one_or_none()
         if not event:
+            deleted_event = await session.scalar(select(Event).where(Event.slug == event_slug))
+            if deleted_event:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
+            await _verify_event_access(session, request, None, credentials=credentials, token=token)
             try:
                 event = Event(slug=event_slug, display_name=event_slug.title())
             except ValueError as exc:
@@ -146,6 +369,16 @@ async def create_event_booth(
             elif room.display_name != display_name:
                 room.display_name = display_name
                 await session.flush()
+
+        await _verify_event_access(
+            session,
+            request,
+            event.id,
+            room_id=room.id,
+            credentials=credentials,
+            token=token,
+            require_booth_management=True,
+        )
 
         db_room_id = room.id
 
@@ -197,7 +430,7 @@ async def create_event_booth(
         invite = await create_invite_token(
             session,
             booth_id=db_booth.id,
-            role="interpreter",
+            role=INTERPRETER,
             label="API Provisioned",
         )
         await session.flush()
@@ -211,9 +444,14 @@ async def create_event_booth(
 
 
 @router.delete(
+    "/events/{event_slug}/eventyay-rooms/{eventyay_room_id}/booths/{language_code}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+@router.delete(
     "/events/{event_slug}/rooms/{eventyay_room_id}/booths/{language_code}", status_code=status.HTTP_204_NO_CONTENT
 )
 async def delete_event_booth(
+    request: Request,
     event_slug: str,
     eventyay_room_id: str,
     language_code: str,
@@ -221,11 +459,11 @@ async def delete_event_booth(
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
 ):
     """Delete a booth provisioned via API."""
-    _require_access(credentials, token)
-
+    booth_id = ""
+    room_id = 0
     async with get_session() as session:
         # Find the event
-        event_query = await session.execute(select(Event).where(Event.slug == event_slug))
+        event_query = await session.execute(select(Event).where(Event.slug == event_slug, Event.deleted_at.is_(None)))
         event = event_query.scalar_one_or_none()
         if not event:
             raise HTTPException(status_code=404, detail="Event not found")
@@ -238,6 +476,18 @@ async def delete_event_booth(
         if not room:
             raise HTTPException(status_code=404, detail="Room not found")
 
+        await _verify_event_access(
+            session,
+            request,
+            event.id,
+            room_id=room.id,
+            credentials=credentials,
+            token=token,
+            require_booth_management=True,
+        )
+        room_id = room.id
+        booth_id = make_booth_id(event_slug, room.id, language_code)
+
         # Find the booth
         booth_query = await session.execute(
             select(DBBooth).where(
@@ -247,8 +497,16 @@ async def delete_event_booth(
         booth = booth_query.scalar_one_or_none()
 
         if booth:
-            await session.delete(booth)
-            await session.flush()
+            try:
+                async with session.begin_nested():
+                    await delete_booth(session, booth.id)
+            except (StaleDataError, ObjectDeletedError):
+                pass
+
+    try:
+        await stop_transcription_worker(booth_id)
+    finally:
+        await booths.remove_booth(event_slug, room_id, language_code)
 
 
 @router.get("/events/{event_slug}/booths")
@@ -259,16 +517,12 @@ async def list_event_booths(
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
 ) -> dict:
     """List all booths for an event."""
-    try:
-        _require_access(request, credentials, token)
-    except HTTPException as orig_exc:
-        # Fallback to checking API Key
-        async with get_session() as session:
-            key = None
-            if credentials and credentials.scheme.lower() == 'bearer':
-                key = await verify_api_key(session, credentials.credentials)
-            if not key or key.event.slug != event_slug:
-                raise orig_exc
+    async with get_session() as session:
+        event = await session.scalar(select(Event).where(Event.slug == event_slug, Event.deleted_at.is_(None)))
+        if not event:
+            await _verify_event_access(session, request, None, credentials=credentials, token=token)
+            return {"event_slug": event_slug, "booths": []}
+        await _verify_event_access(session, request, event.id, credentials=credentials, token=token)
 
     booth_list = await booths.list_booths_for_event(event_slug)
     for b in booth_list:
@@ -281,7 +535,7 @@ async def list_event_booths(
 
     async with get_session() as session:
 
-        stmt = select(Event).where(Event.slug == event_slug).options(
+        stmt = select(Event).where(Event.slug == event_slug, Event.deleted_at.is_(None)).options(
             selectinload(Event.rooms).selectinload(Room.translation_languages)
         )
         event = await session.scalar(stmt)
@@ -317,11 +571,14 @@ async def event_booth_state(
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
 ) -> dict:
     """Event-scoped booth state — never auto-creates a booth."""
-    _require_access(request, credentials, token)
-
+    try:
+        slug = validate_event_slug(event_slug)
+        code = validate_language_code(language_code)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     if room_id is None:
         async with get_session() as session:
-            ev = await get_event_by_slug(session, event_slug)
+            ev = await get_event_by_slug(session, slug)
             if ev:
                 rooms = await list_rooms_for_event(session, ev.id)
                 if len(rooms) > 1:
@@ -333,15 +590,30 @@ async def event_booth_state(
         if room_id is None:
             room_id = 1
 
-    state = await booths.get_booth_for_event(event_slug, room_id, language_code)
+    async with get_session() as session:
+        event = await get_event_by_slug(session, slug)
+        if event is None:
+            deleted = await session.scalar(select(Event).where(Event.slug == slug))
+            if deleted is not None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
+            await _verify_event_access(session, request, None, credentials=credentials, token=token)
+        else:
+            await _verify_resource_access(
+                session,
+                request,
+                event,
+                room_id=room_id,
+                language_code=code,
+                credentials=credentials,
+                token=token,
+            )
+    state = await booths.get_booth_for_event(slug, room_id, code)
     if state is None:
         # Booth state lives in memory, so it is empty after a restart and for
         # booths added in the admin UI. Load booths that exist in the database
         # instead of failing the booth page; unknown booths still get a 404.
         # Match the in-memory lookup: normalised coordinates, live events only,
         # and the room must belong to the event.
-        slug = validate_event_slug(event_slug)
-        code = validate_language_code(language_code)
         async with get_session() as session:
             stmt = (
                 select(DBBooth)
@@ -382,8 +654,6 @@ async def event_booth_whip_url(
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
 ) -> dict:
     """Event-scoped WHIP URL — validates event ownership before returning."""
-    _require_access(request, credentials, token)
-
     if room_id is None:
         async with get_session() as session:
             ev = await get_event_by_slug(session, event_slug)
@@ -397,6 +667,25 @@ async def event_booth_whip_url(
                     room_id = rooms[0].id
         if room_id is None:
             room_id = 1
+
+    async with get_session() as session:
+        event = await get_event_by_slug(session, event_slug)
+        if event is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
+        auth_payload = await _verify_resource_access(
+            session,
+            request,
+            event,
+            room_id=room_id,
+            language_code=language_code,
+            credentials=credentials,
+            token=token,
+        )
+        if auth_payload and not auth_payload.get("user") and auth_payload.get("purpose") != "legacy_api":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Participant credentials cannot request an unbound WHIP URL.",
+            )
 
     booth_id = make_booth_id(event_slug, room_id, language_code)
     channel_id = make_mediamtx_path(event_slug, room_id, language_code)
@@ -422,14 +711,31 @@ async def api_transcription_start(
     token: str = Query(""),
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
 ):
-    _require_access(request, credentials, token)
     booth_id = make_booth_id(event_slug, room_id, language_code)
     async with get_session() as session:
+        event = await get_event_by_slug(session, event_slug)
+        if event is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
+        await _verify_resource_access(
+            session,
+            request,
+            event,
+            room_id=room_id,
+            language_code=language_code,
+            credentials=credentials,
+            token=token,
+            require_booth_management=True,
+        )
         stmt = (
             select(DBBooth)
             .join(Event)
             .options(selectinload(DBBooth.event))
-            .where(Event.slug == event_slug, DBBooth.room_id == room_id, DBBooth.language_code == language_code)
+            .where(
+                Event.slug == event_slug,
+                Event.deleted_at.is_(None),
+                DBBooth.room_id == room_id,
+                DBBooth.language_code == language_code,
+            )
         )
         db_booth = await session.scalar(stmt)
         if not db_booth or not db_booth.transcription_enabled:
@@ -479,7 +785,20 @@ async def api_transcription_stop(
     token: str = Query(""),
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
 ):
-    _require_access(request, credentials, token)
     booth_id = make_booth_id(event_slug, room_id, language_code)
+    async with get_session() as session:
+        event = await get_event_by_slug(session, event_slug)
+        if event is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
+        await _verify_resource_access(
+            session,
+            request,
+            event,
+            room_id=room_id,
+            language_code=language_code,
+            credentials=credentials,
+            token=token,
+            require_booth_management=True,
+        )
     await stop_transcription_worker(booth_id)
     return {"status": "stopped"}
