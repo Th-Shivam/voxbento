@@ -58,6 +58,7 @@ async def test_sitemap_uses_configured_canonical_base(
     canonical_base: str,
     headers: dict[str, str],
 ) -> None:
+    """Ensure sitemap URLs use configuration rather than request host headers."""
     monkeypatch.setattr(settings, "public_base_url", configured_base)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver.test") as client:
         response = await client.get("/sitemap.xml", headers=headers)

@@ -167,6 +167,7 @@ See those pages for specific benchmarking data and methodologies.
 
 @router.get("/sitemap.xml")
 async def sitemap(request: Request) -> Response:
+    """Return the public sitemap using the configured canonical base URL."""
     base_url = escape(settings.public_base_url.rstrip("/"), quote=False)
     xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
