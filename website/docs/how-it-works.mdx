@@ -384,8 +384,10 @@ own `.env` for local-only debugging; never enable it for deployments.
 Production deployments must set `BOOTH_ACCESS_TOKEN` and
 `MEDIAMTX_AUTH_HOOK_SECRET` in the deployment secret store to separate strong
 values, for example generated with `openssl rand -hex 32`. The portal refuses to
-start when either value is missing or weak; the same production check also requires
-`API_KEY_ENCRYPTION_KEY` for encrypted provider keys and queued email.
+start when `BOOTH_ACCESS_TOKEN` is missing or weak, or when
+`MEDIAMTX_AUTH_HOOK_SECRET` is missing. The hook secret's strength is not measured
+by startup validation, so keep it strong and private. The same production check
+also requires `API_KEY_ENCRYPTION_KEY` for encrypted provider keys and queued email.
 
 Production deployment builds and validates a separate candidate checkout before
 updating the live checkout. The portal reads code and dependencies from its Docker

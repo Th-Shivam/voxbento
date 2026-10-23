@@ -140,7 +140,7 @@ finally:
 
 Defaults keep debug disabled (`DEBUG=false`) and startup secret checks active. Developers may explicitly set `DEBUG=true` in their own `.env` for local-only debugging; never enable it for deployments.
 
-For production, configure `BOOTH_ACCESS_TOKEN` and `MEDIAMTX_AUTH_HOOK_SECRET` with separate strong values, for example from `openssl rand -hex 32`. Startup refuses missing or weak values.
+For production, configure `BOOTH_ACCESS_TOKEN` and `MEDIAMTX_AUTH_HOOK_SECRET` with separate strong values, for example from `openssl rand -hex 32`. Startup rejects a missing or weak `BOOTH_ACCESS_TOKEN` and a missing `MEDIAMTX_AUTH_HOOK_SECRET`; it does not measure the hook secret's strength, so keep it strong and private.
 
 ### 4. Run the Stack
 
