@@ -113,6 +113,12 @@ open('.env', 'w').write(env)
 "
 ```
 
+For self-hosted domains, set `PUBLIC_BASE_URL` in `.env` to your public URL, for
+example `PUBLIC_BASE_URL=https://interpret.example.com`. It defaults to
+`https://voxbento.com` and is used for email links and canonical URLs in
+`/sitemap.xml`. Sitemap URL generation accepts trailing slashes and preserves any
+configured path prefix.
+
 ### 4. Run the Stack
 
 **Option A: Using Docker (Recommended for full stack)**
