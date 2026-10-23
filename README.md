@@ -101,23 +101,46 @@ uv sync --all-groups
 
 ### 3. Configure Environment
 
-For **NEW local setups only**, copy the example configuration and generate separate strong secrets. Do not overwrite an existing `.env` or rotate existing keys with this command; it refuses to replace an existing file.
+For **NEW local setups only**, copy the example configuration and generate separate strong secrets. Do not overwrite an existing `.env` or rotate existing keys with this command; it refuses to replace an existing file. The generated file is owner-readable only.
+
+The encryption key protects stored provider keys and queued email (sign-in links,
+invitations and password resets). Outgoing email is sent from a durable outbox once
+`SMTP_HOST` is set; Admins edit email templates and see delivery status in
+**Admin → Emails**. Email branding defaults to the transparent VoxBento V mark.
 
 ```bash
 uv run python -c "
 import secrets, re
+import os, tempfile
+from pathlib import Path
+
+target = Path('.env')
+if target.exists():
+    raise SystemExit('.env already exists; refusing to replace it')
 env = open('.env.example').read()
 for name in (
     'SECRET_KEY', 'API_KEY_ENCRYPTION_KEY',
     'MEDIAMTX_AUTH_HOOK_SECRET', 'BOOTH_ACCESS_TOKEN',
 ):
     env = re.sub(rf'^{name}=.*$', f'{name}={secrets.token_hex(32)}', env, flags=re.MULTILINE)
-with open('.env', 'x') as f:
+with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir='.', prefix='.env.', delete=False) as f:
+    os.chmod(f.name, 0o600)
     f.write(env)
+    f.flush()
+    os.fsync(f.fileno())
+temporary = Path(f.name)
+try:
+    os.link(temporary, target)
+except FileExistsError:
+    raise SystemExit('.env already exists; refusing to replace it')
+finally:
+    temporary.unlink(missing_ok=True)
 "
 ```
 
 Defaults keep debug disabled (`DEBUG=false`) and startup secret checks active. Developers may explicitly set `DEBUG=true` in their own `.env` for local-only debugging; never enable it for deployments.
+
+For production, configure `BOOTH_ACCESS_TOKEN` and `MEDIAMTX_AUTH_HOOK_SECRET` with separate strong values, for example from `openssl rand -hex 32`. Startup refuses missing or weak values.
 
 ### 4. Run the Stack
 
