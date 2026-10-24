@@ -142,6 +142,12 @@ Defaults keep debug disabled (`DEBUG=false`) and startup secret checks active. D
 
 For production, configure `BOOTH_ACCESS_TOKEN` and `MEDIAMTX_AUTH_HOOK_SECRET` with separate strong values, for example from `openssl rand -hex 32`. Startup rejects a missing or weak `BOOTH_ACCESS_TOKEN` and a missing `MEDIAMTX_AUTH_HOOK_SECRET`; it does not measure the hook secret's strength, so keep it strong and private.
 
+For self-hosted domains, set `PUBLIC_BASE_URL` in `.env` to your public URL, for
+example `PUBLIC_BASE_URL=https://interpret.example.com`. It defaults to
+`https://voxbento.com` and is used for email links and canonical URLs in
+`/sitemap.xml`. Sitemap URL generation accepts trailing slashes and preserves any
+configured path prefix.
+
 ### 4. Run the Stack
 
 **Option A: Using Docker (Recommended for full stack)**

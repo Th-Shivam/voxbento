@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -150,6 +150,15 @@ class Settings(BaseSettings):
     # Team inbox notified of each new hosting access request.
     hosting_requests_email: str = "voxbento.dev@gmail.com"
     public_base_url: str = "https://voxbento.com"
+
+    @field_validator("public_base_url")
+    @classmethod
+    def validate_public_base_url(cls, value: str) -> str:
+        """Reject query strings and fragments from canonical public URLs."""
+        parsed = urlparse(value)
+        if parsed.query or parsed.fragment:
+            raise ValueError("public_base_url must not include a query string or fragment")
+        return value
 
 
 settings = Settings()

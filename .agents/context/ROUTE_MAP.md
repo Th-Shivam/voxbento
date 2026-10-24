@@ -11,6 +11,7 @@
 |---|---|---|---|---|
 | GET | `/` | open | `home.html` | Landing page; no event or booth lists; navbar links personalised if logged in |
 | GET | `/local` | open | `local.html` | VoxBento Local desktop console download page with client OS detection & release links |
+| GET | `/sitemap.xml` | open | — | XML sitemap; canonical URLs use `PUBLIC_BASE_URL` (default `https://voxbento.com`), not request `Host`; trailing slashes stripped, path prefix preserved, URLs XML-escaped |
 | GET | `/healthz` | open | — | JSON: `{ok, server, mediamtx_ok}` |
 | GET | `/register` | open | `register.html` | Redirects to `/account` if already logged in |
 | POST | `/register` | open | `register.html` | Creates user, sets `user_token` cookie → `/account`; if `password` is set, `password_confirm` must match (422 otherwise) |
@@ -134,7 +135,7 @@ with `?error=invalid_role&role=…` and the page explains why.
 
 | Module | Owns |
 |---|---|
-| `portal/routers/public.py` | Home page, health check, registration |
+| `portal/routers/public.py` | Home page, sitemap, health check, registration |
 | `portal/routers/auth.py` | Login, logout, invite-token validation, and user profile page |
 | `portal/routers/interpreter.py` | Booth UI route |
 | `portal/routers/listener.py` | WHEP listener UI route |
