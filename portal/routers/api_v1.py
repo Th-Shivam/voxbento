@@ -29,6 +29,7 @@ from portal.roles import EVENT_OWNER
 from portal.transcription.constants import ALLOWED_MODELS, ProviderEnum
 from portal.transcription.providers.base import get_api_key
 from portal.transcription.worker import active_workers, start_transcription_worker, stop_transcription_worker
+from portal.translations.constants import TranslationProviderEnum
 
 logger = logging.getLogger(__name__)
 
@@ -450,7 +451,7 @@ class RoomUpsert(BaseModel):
     transcription_model: str | None = Field(None, max_length=40)
     source_language: str | None = Field(None, max_length=10)
     enable_translation: bool | None = None
-    translation_provider: str | None = Field(None, max_length=50)
+    translation_provider: TranslationProviderEnum | None = Field(None)
     translation_model: str | None = Field(None, max_length=100)
 
     @field_validator(
@@ -527,9 +528,8 @@ class RoomSettingsUpdate(BaseModel):
         None,
         validation_alias=AliasChoices("floor_translation_enabled", "enable_translation"),
     )
-    floor_translation_provider: str | None = Field(
+    floor_translation_provider: TranslationProviderEnum | None = Field(
         None,
-        max_length=50,
         validation_alias=AliasChoices("floor_translation_provider", "translation_provider"),
     )
     floor_translation_model: str | None = Field(
@@ -616,7 +616,8 @@ def _apply_floor_settings(room, payload_dict: dict):
     if "enable_translation" in payload_dict and payload_dict["enable_translation"] is not None:
         room.floor_translation_enabled = payload_dict["enable_translation"]
     if "translation_provider" in payload_dict:
-        room.floor_translation_provider = payload_dict["translation_provider"]
+        val = payload_dict["translation_provider"]
+        room.floor_translation_provider = getattr(val, "value", val)
     if "translation_model" in payload_dict:
         room.floor_translation_model = payload_dict["translation_model"]
 

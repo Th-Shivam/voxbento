@@ -214,6 +214,7 @@ async def test_create_without_name_is_rejected():
         {"name": "Main Hall", "target_languages": ["x" * 40]},
         {"name": "Main Hall", "target_languages": ["zz"]},
         {"name": "Main Hall", "target_languages": ["floor"]},
+        {"name": "Main Hall", "translation_provider": "unsupported-provider"},
     ],
 )
 async def test_invalid_values_are_rejected(payload):
@@ -251,11 +252,12 @@ async def test_patch_room_settings_updates_the_room_and_returns_changed_values()
             f"/api/v1/events/{event.slug}/rooms/{room_id}/settings",
             json={
                 "name": "  Main Hall Renamed  ",
-                "audio_delay_ms": 2500,
-                "enable_transcription": True,
-                "transcription_provider": "local",
-                "transcription_model": "base",
-                "source_language": "en",
+        "audio_delay_ms": 2500,
+        "enable_transcription": True,
+        "transcription_provider": "local",
+        "transcription_model": "base",
+        "source_language": "en",
+        "translation_provider": "openai",
             },
             headers=_auth(),
         )
@@ -271,6 +273,7 @@ async def test_patch_room_settings_updates_the_room_and_returns_changed_values()
             "floor_transcription_provider": "local",
             "floor_transcription_model": "base",
             "floor_language_code": "en",
+            "floor_translation_provider": "openai",
         },
     }
 
@@ -282,6 +285,7 @@ async def test_patch_room_settings_updates_the_room_and_returns_changed_values()
         assert updated.floor_transcription_provider == "local"
         assert updated.floor_transcription_model == "base"
         assert updated.floor_language_code == "en"
+        assert updated.floor_translation_provider == "openai"
         assert updated.display_name == "Main Hall Renamed"
         assert updated.jitsi_url == "https://meet.example.org/main-hall"
 
@@ -332,6 +336,26 @@ async def test_patch_room_settings_rejects_a_transcription_model_for_the_wrong_p
 
     assert resp.status_code == 422
     assert "Invalid transcription model" in resp.json()["detail"]
+
+
+@pytest.mark.anyio
+async def test_patch_room_settings_rejects_an_unknown_translation_provider():
+    """Reject translation providers that have no registered worker implementation."""
+
+    from portal.database import create_room, get_session
+
+    event = await _seed()
+    async with get_session() as s:
+        room = await create_room(s, event_id=event.id, display_name="Main Hall")
+
+    async with _client() as c:
+        response = await c.patch(
+            f"/api/v1/events/{event.slug}/rooms/{room.id}/settings",
+            json={"translation_provider": "unsupported-provider"},
+            headers=_auth(),
+        )
+
+    assert response.status_code == 422
 
 
 @pytest.mark.anyio
