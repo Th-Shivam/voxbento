@@ -147,6 +147,10 @@ class Settings(BaseSettings):
     # Team inbox notified of each new hosting access request.
     hosting_requests_email: str = "voxbento.dev@gmail.com"
     public_base_url: str = "https://voxbento.com"
+    # Webhook Settings
+    max_webhook_subscriptions: int = 50
+    # Caption WebSocket Settings
+    max_anonymous_caption_listeners_per_booth: int = 500
 
     @field_validator("public_base_url")
     @classmethod
