@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
@@ -99,12 +100,12 @@ async def _verify_token_rbac(
     db: AsyncSession,
     token: OAuthToken,
     event: Event,
-    room_id: int | None = None,
+    room_id: int | str | None = None,
     *,
     manage: bool = False,
     lock_event: bool = False,
     write_lock: bool = False,
-) -> None:
+) -> Room | None:
     """Validate OAuth RBAC and optionally lock the event for a mutating request.
 
     manage=True is for creating, changing or deleting rooms and booths, which only Admins and
@@ -120,32 +121,64 @@ async def _verify_token_rbac(
     if token.event_id != event.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
 
+    resolved_room: Room | None = None
     if room_id is not None:
-        room = await db.get(Room, room_id)
-        if not room or room.event_id != event.id:
+        # Check Eventyay ID first to avoid colliding with an internal autoincrement ID in the same event
+        stmt = select(Room).where(Room.event_id == event.id, Room.eventyay_room_id == str(room_id))
+        res = await db.execute(stmt)
+        resolved_room = res.scalars().first()
+
+        parsed_id: int | None = None
+        if isinstance(room_id, int):
+            parsed_id = room_id
+        elif isinstance(room_id, str) and room_id.isascii() and room_id.isdecimal():
+            try:
+                parsed_id = int(room_id)
+            except ValueError:
+                parsed_id = None
+
+        if not resolved_room and parsed_id is not None:
+            resolved_room = await db.get(Room, parsed_id)
+            if resolved_room and resolved_room.event_id != event.id:
+                resolved_room = None
+
+        if not resolved_room:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Room not found")
 
     # Confidential clients manage their own RBAC
     client = await db.get(OAuthClient, token.client_id)
     if client and client.is_confidential and client.status == "active":
-        return
+        return resolved_room
 
     # Check if user is Admin or event owner
     from portal.models import User
 
     user = await db.get(User, token.user_id)
     if user and getattr(user, "is_admin", False):
-        return
+        return resolved_room
 
     scope = await load_membership_scope(db, token.user_id)
     if event.id in scope["owned_event_ids"]:
-        return
+        return resolved_room
 
     # Room coordinators may be given per event, room or booth (#757); the room was checked above.
-    if not manage and room_id is not None and coordinates_room(scope, room_id, event.id):
-        return
+    if not manage and resolved_room is not None and coordinates_room(scope, resolved_room.id, event.id):
+        return resolved_room
 
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User lost RBAC access to this resource")
+
+
+def _extract_room_id(room: Room | Any, room_id: int | str) -> int:
+    if room is not None and hasattr(room, "id") and isinstance(room.id, int):
+        return room.id
+    if isinstance(room_id, int):
+        return room_id
+    if isinstance(room_id, str) and room_id.isascii() and room_id.isdecimal():
+        try:
+            return int(room_id)
+        except ValueError:
+            pass
+    return getattr(room, "id", room_id)
 
 
 @router.get("/events/{event_slug}")
@@ -664,7 +697,7 @@ async def delete_room(
 @router.patch("/events/{event_slug}/rooms/{room_id}/settings")
 async def patch_room_settings(
     event_slug: str,
-    room_id: int,
+    room_id: int | str,
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("rooms:write")),
 ):
@@ -681,7 +714,7 @@ async def patch_room_settings(
 @router.get("/events/{event_slug}/rooms/{room_id}/booths")
 async def list_booths(
     event_slug: str,
-    room_id: int,
+    room_id: int | str,
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("booths:read")),
 ):
@@ -690,16 +723,17 @@ async def list_booths(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    await _verify_token_rbac(db, token, event, room_id, lock_event=True)
+    room = await _verify_token_rbac(db, token, event, room_id, lock_event=True)
+    target_room_id = _extract_room_id(room, room_id)
 
-    result = await db.execute(select(DBBooth).where(DBBooth.room_id == room_id, DBBooth.event_id == event.id))
+    result = await db.execute(select(DBBooth).where(DBBooth.room_id == target_room_id, DBBooth.event_id == event.id))
     booths_list = result.scalars().all()
 
     return [
         {
             "id": b.id,
             "language_code": b.language_code,
-            "whip_path": make_mediamtx_path(event.slug, room_id, b.language_code),
+            "whip_path": make_mediamtx_path(event.slug, target_room_id, b.language_code),
             "created_at": b.created_at.isoformat(),
         }
         for b in booths_list
@@ -709,7 +743,7 @@ async def list_booths(
 @router.get("/events/{event_slug}/rooms/{room_id}/booths/{language_code}")
 async def get_booth(
     event_slug: str,
-    room_id: int,
+    room_id: int | str,
     language_code: str,
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("booths:read")),
@@ -719,9 +753,10 @@ async def get_booth(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    await _verify_token_rbac(db, token, event, room_id, lock_event=True)
+    room = await _verify_token_rbac(db, token, event, room_id, lock_event=True)
+    target_room_id = _extract_room_id(room, room_id)
 
-    result = await db.execute(select(DBBooth).where(DBBooth.room_id == room_id, DBBooth.language_code == language_code, DBBooth.event_id == event.id))
+    result = await db.execute(select(DBBooth).where(DBBooth.room_id == target_room_id, DBBooth.language_code == language_code, DBBooth.event_id == event.id))
     booth = result.scalars().first()
     if not booth:
         raise HTTPException(status_code=404, detail="Booth not found")
@@ -729,7 +764,7 @@ async def get_booth(
     return {
         "id": booth.id,
         "language_code": booth.language_code,
-        "whip_path": make_mediamtx_path(event.slug, room_id, booth.language_code),
+        "whip_path": make_mediamtx_path(event.slug, target_room_id, booth.language_code),
         "created_at": booth.created_at.isoformat(),
     }
 
@@ -737,7 +772,7 @@ async def get_booth(
 @router.post("/events/{event_slug}/rooms/{room_id}/booths/{language_code}")
 async def create_booth(
     event_slug: str,
-    room_id: int,
+    room_id: int | str,
     language_code: str,
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("booths:write")),
@@ -746,28 +781,29 @@ async def create_booth(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    await _verify_token_rbac(
+    room = await _verify_token_rbac(
         db, token, event, room_id, manage=True, lock_event=True, write_lock=True
     )
+    target_room_id = _extract_room_id(room, room_id)
 
-    result = await db.execute(select(DBBooth).where(DBBooth.room_id == room_id, DBBooth.language_code == language_code))
+    result = await db.execute(select(DBBooth).where(DBBooth.room_id == target_room_id, DBBooth.language_code == language_code))
     if result.scalars().first():
         raise HTTPException(status_code=409, detail="Booth already exists")
 
     from portal.booth_identity import make_mediamtx_path
 
-    booth = DBBooth(room_id=room_id, language_code=language_code, event_id=event.id, language_name=language_code)
+    booth = DBBooth(room_id=target_room_id, language_code=language_code, event_id=event.id, language_name=language_code)
     db.add(booth)
     await db.flush()
 
-    whip_path = make_mediamtx_path(event.slug, room_id, language_code)
+    whip_path = make_mediamtx_path(event.slug, target_room_id, language_code)
     return {"status": "success", "booth_id": booth.id, "whip_path": whip_path}
 
 
 @router.delete("/events/{event_slug}/rooms/{room_id}/booths/{language_code}")
 async def delete_booth_endpoint(
     event_slug: str,
-    room_id: int,
+    room_id: int | str,
     language_code: str,
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("booths:write")),
@@ -776,11 +812,12 @@ async def delete_booth_endpoint(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    await _verify_token_rbac(
+    room = await _verify_token_rbac(
         db, token, event, room_id, manage=True, lock_event=True, write_lock=True
     )
+    target_room_id = _extract_room_id(room, room_id)
 
-    result = await db.execute(select(DBBooth).where(DBBooth.room_id == room_id, DBBooth.language_code == language_code, DBBooth.event_id == event.id))
+    result = await db.execute(select(DBBooth).where(DBBooth.room_id == target_room_id, DBBooth.language_code == language_code, DBBooth.event_id == event.id))
     booth = result.scalars().first()
     if not booth:
         raise HTTPException(status_code=404, detail="Booth not found")
@@ -794,7 +831,7 @@ async def delete_booth_endpoint(
 @router.post("/events/{event_slug}/rooms/{room_id}/booths/{language_code}/transcription/start")
 async def start_transcription(
     event_slug: str,
-    room_id: int,
+    room_id: int | str,
     language_code: str,
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("sessions:manage")),
@@ -803,9 +840,10 @@ async def start_transcription(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    await _verify_token_rbac(db, token, event, room_id, lock_event=True, write_lock=True)
+    room = await _verify_token_rbac(db, token, event, room_id, lock_event=True, write_lock=True)
+    target_room_id = _extract_room_id(room, room_id)
 
-    booth_id = make_booth_id(event_slug, language_code)
+    booth_id = make_booth_id(event_slug, target_room_id, language_code)
 
     # Actually start transcription using the registry
     if booth_id not in booths:
@@ -820,7 +858,7 @@ async def start_transcription(
 @router.post("/events/{event_slug}/rooms/{room_id}/booths/{language_code}/transcription/stop")
 async def stop_transcription(
     event_slug: str,
-    room_id: int,
+    room_id: int | str,
     language_code: str,
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("sessions:manage")),
@@ -829,9 +867,10 @@ async def stop_transcription(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    await _verify_token_rbac(db, token, event, room_id, lock_event=True, write_lock=True)
+    room = await _verify_token_rbac(db, token, event, room_id, lock_event=True, write_lock=True)
+    target_room_id = _extract_room_id(room, room_id)
 
-    booth_id = make_booth_id(event_slug, room_id, language_code)
+    booth_id = make_booth_id(event_slug, target_room_id, language_code)
     await stop_transcription_worker(booth_id)
     return {"status": "stopped", "booth_id": booth_id}
 
@@ -839,7 +878,7 @@ async def stop_transcription(
 @router.get("/events/{event_slug}/rooms/{room_id}/status")
 async def get_transcription_status(
     event_slug: str,
-    room_id: int,
+    room_id: int | str,
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("sessions:read")),
 ):
@@ -848,15 +887,16 @@ async def get_transcription_status(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    await _verify_token_rbac(db, token, event, room_id, lock_event=True)
+    room = await _verify_token_rbac(db, token, event, room_id, lock_event=True)
+    target_room_id = _extract_room_id(room, room_id)
 
     # Collect statuses for all booths in the room
-    result = await db.execute(select(DBBooth).where(DBBooth.room_id == room_id, DBBooth.event_id == event.id))
+    result = await db.execute(select(DBBooth).where(DBBooth.room_id == target_room_id, DBBooth.event_id == event.id))
     booths_list = result.scalars().all()
 
     statuses = {}
     for b in booths_list:
-        bid = make_booth_id(event_slug, room_id, b.language_code)
+        bid = make_booth_id(event_slug, target_room_id, b.language_code)
         statuses[b.language_code] = {
             "is_active": booths.get_booth_sync(bid) is not None,
             # Running transcription is tracked by the worker registry, not on the
@@ -864,13 +904,14 @@ async def get_transcription_status(
             "transcription_running": bid in active_workers,
         }
 
-    return {"room_id": room_id, "statuses": statuses}
+    return {"room_id": target_room_id, "statuses": statuses}
+
 
 
 @router.get("/events/{event_slug}/rooms/{room_id}/booths/{language_code}/transcripts/export")
 async def export_transcript(
     event_slug: str,
-    room_id: int,
+    room_id: int | str,
     language_code: str,
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("transcripts:read")),
@@ -888,7 +929,7 @@ async def export_transcript(
 @router.post("/events/{event_slug}/rooms/{room_id}/listener-token")
 async def provision_listener_token(
     event_slug: str,
-    room_id: int,
+    room_id: int | str,
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("listeners:provision")),
 ):
