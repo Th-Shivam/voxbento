@@ -107,6 +107,7 @@ async def _verify_token_rbac(
     manage: bool = False,
     lock_event: bool = False,
     write_lock: bool = False,
+    room_id_kind: Literal["auto", "internal", "eventyay"] = "auto",
 ) -> Room | None:
     """Validate OAuth RBAC and optionally lock the event for a mutating request.
 
@@ -125,24 +126,27 @@ async def _verify_token_rbac(
 
     resolved_room: Room | None = None
     if room_id is not None:
-        # Check Eventyay ID first to avoid colliding with an internal autoincrement ID in the same event
-        stmt = select(Room).where(Room.event_id == event.id, Room.eventyay_room_id == str(room_id))
-        res = await db.execute(stmt)
-        resolved_room = res.scalars().first()
+        if room_id_kind in {"auto", "eventyay"}:
+            # ``auto`` keeps the existing Eventyay-ID-first behavior for legacy
+            # routes. Settings updates use an explicit identifier kind instead.
+            stmt = select(Room).where(Room.event_id == event.id, Room.eventyay_room_id == str(room_id))
+            res = await db.execute(stmt)
+            resolved_room = res.scalars().first()
 
-        parsed_id: int | None = None
-        if isinstance(room_id, int):
-            parsed_id = room_id
-        elif isinstance(room_id, str) and room_id.isascii() and room_id.isdecimal():
-            try:
-                parsed_id = int(room_id)
-            except ValueError:
-                parsed_id = None
+        if not resolved_room and room_id_kind in {"auto", "internal"}:
+            parsed_id: int | None = None
+            if isinstance(room_id, int):
+                parsed_id = room_id
+            elif room_id_kind == "auto" and isinstance(room_id, str) and room_id.isascii() and room_id.isdecimal():
+                try:
+                    parsed_id = int(room_id)
+                except ValueError:
+                    parsed_id = None
 
-        if not resolved_room and parsed_id is not None:
-            resolved_room = await db.get(Room, parsed_id)
-            if resolved_room and resolved_room.event_id != event.id:
-                resolved_room = None
+            if parsed_id is not None:
+                resolved_room = await db.get(Room, parsed_id)
+                if resolved_room and resolved_room.event_id != event.id:
+                    resolved_room = None
 
         if not resolved_room:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Room not found")
@@ -818,22 +822,31 @@ async def delete_room(
     return None
 
 
-@router.patch("/events/{event_slug}/rooms/{room_id}/settings")
-async def patch_room_settings(
+async def _patch_room_settings(
     event_slug: str,
     room_id: int | str,
     payload: RoomSettingsUpdate,
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("rooms:write")),
+    *,
+    room_id_kind: Literal["internal", "eventyay"],
+    request_room_id: int | str,
 ):
-    """Apply a validated partial update to a room addressed by either room ID."""
+    """Apply a validated partial update to an explicitly identified room."""
 
     event = await _get_event_for_request(db, event_slug, write_lock=True)
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
     room = await _verify_token_rbac(
-        db, token, event, room_id, manage=True, lock_event=True, write_lock=True
+        db,
+        token,
+        event,
+        room_id,
+        manage=True,
+        lock_event=True,
+        write_lock=True,
+        room_id_kind=room_id_kind,
     )
     if room is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Room not found")
@@ -898,7 +911,7 @@ async def patch_room_settings(
         token_id=token.id,
         client_id=token.client_id,
         action="room.settings_updated",
-        request_path=f"/api/v1/events/{event_slug}/rooms/{room_id}/settings",
+        request_path=f"/api/v1/events/{event_slug}/rooms/{request_room_id}/settings",
         status_code=status.HTTP_200_OK,
     )
     db.add(audit)
@@ -909,6 +922,48 @@ async def patch_room_settings(
         "room_id": room.id,
         "settings": {field: getattr(room, field) for field in updates},
     }
+
+
+@router.patch("/events/{event_slug}/rooms/{room_id}/settings")
+async def patch_room_settings(
+    event_slug: str,
+    room_id: int,
+    payload: RoomSettingsUpdate,
+    db: AsyncSession = Depends(get_db_session),
+    token: OAuthToken = Depends(require_oauth_scope("rooms:write")),
+):
+    """Update a room using its internal primary-key identifier."""
+
+    return await _patch_room_settings(
+        event_slug,
+        room_id,
+        payload,
+        db,
+        token,
+        room_id_kind="internal",
+        request_room_id=room_id,
+    )
+
+
+@router.patch("/events/{event_slug}/rooms/eventyay/{eventyay_room_id}/settings")
+async def patch_eventyay_room_settings(
+    event_slug: str,
+    eventyay_room_id: str,
+    payload: RoomSettingsUpdate,
+    db: AsyncSession = Depends(get_db_session),
+    token: OAuthToken = Depends(require_oauth_scope("rooms:write")),
+):
+    """Update a room using its explicit Eventyay room identifier."""
+
+    return await _patch_room_settings(
+        event_slug,
+        eventyay_room_id,
+        payload,
+        db,
+        token,
+        room_id_kind="eventyay",
+        request_room_id=f"eventyay/{eventyay_room_id}",
+    )
 
 
 @router.get("/events/{event_slug}/rooms/{room_id}/booths")

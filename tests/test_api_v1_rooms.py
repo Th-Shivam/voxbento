@@ -352,7 +352,7 @@ async def test_patch_room_settings_resolves_eventyay_room_id():
         internal_room_id = created.json()["room_id"]
 
         updated = await c.patch(
-            f"/api/v1/events/{event.slug}/rooms/eventyay-24/settings",
+            f"/api/v1/events/{event.slug}/rooms/eventyay/eventyay-24/settings",
             json={"audio_delay_ms": 1500},
             headers=_auth(),
         )
@@ -364,6 +364,57 @@ async def test_patch_room_settings_resolves_eventyay_room_id():
         room = await s.get(Room, internal_room_id)
         assert room is not None
         assert room.audio_delay_ms == 1500
+
+
+@pytest.mark.anyio
+async def test_patch_room_settings_requires_an_explicit_identifier_kind_on_collisions():
+    """Keep internal and Eventyay room IDs from selecting each other during updates."""
+
+    from portal.database import get_session
+    from portal.models import Room
+
+    event = await _seed()
+    async with _client() as c:
+        room_a = await c.put(
+            f"/api/v1/events/{event.slug}/rooms/2",
+            json={"name": "Room A"},
+            headers=_auth(),
+        )
+        assert room_a.status_code == 200
+        room_a_id = room_a.json()["room_id"]
+
+        room_b = await c.put(
+            f"/api/v1/events/{event.slug}/rooms/{room_a_id}",
+            json={"name": "Room B"},
+            headers=_auth(),
+        )
+        assert room_b.status_code == 200
+        room_b_id = room_b.json()["room_id"]
+        assert room_a_id != room_b_id
+
+        internal_update = await c.patch(
+            f"/api/v1/events/{event.slug}/rooms/{room_a_id}/settings",
+            json={"name": "Room A Internal Update"},
+            headers=_auth(),
+        )
+        eventyay_update = await c.patch(
+            f"/api/v1/events/{event.slug}/rooms/eventyay/{room_a_id}/settings",
+            json={"name": "Room B Eventyay Update"},
+            headers=_auth(),
+        )
+
+    assert internal_update.status_code == 200, internal_update.text
+    assert eventyay_update.status_code == 200, eventyay_update.text
+    assert internal_update.json()["room_id"] == room_a_id
+    assert eventyay_update.json()["room_id"] == room_b_id
+
+    async with get_session() as s:
+        internal_room = await s.get(Room, room_a_id)
+        eventyay_room = await s.get(Room, room_b_id)
+        assert internal_room is not None
+        assert eventyay_room is not None
+        assert internal_room.display_name == "Room A Internal Update"
+        assert eventyay_room.display_name == "Room B Eventyay Update"
 
 
 @pytest.mark.anyio
