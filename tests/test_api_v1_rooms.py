@@ -339,6 +339,38 @@ async def test_patch_room_settings_rejects_a_transcription_model_for_the_wrong_p
 
 
 @pytest.mark.anyio
+async def test_patch_room_settings_rejects_missing_transcription_provider(monkeypatch):
+    """Return a validation error instead of crashing when a room lacks a provider."""
+
+    from portal.database import create_room, get_session
+    from portal.routers import api_v1
+
+    event = await _seed()
+    async with get_session() as s:
+        room = await create_room(s, event_id=event.id, display_name="Main Hall")
+
+    original_verify = api_v1._verify_token_rbac
+
+    async def verify_room_without_provider(*args, **kwargs):
+        verified_room = await original_verify(*args, **kwargs)
+        assert verified_room is not None
+        setattr(verified_room, "floor_transcription_provider", None)
+        return verified_room
+
+    monkeypatch.setattr(api_v1, "_verify_token_rbac", verify_room_without_provider)
+
+    async with _client() as c:
+        response = await c.patch(
+            f"/api/v1/events/{event.slug}/rooms/{room.id}/settings",
+            json={"enable_transcription": True},
+            headers=_auth(),
+        )
+
+    assert response.status_code == 422
+    assert "valid transcription provider is required" in response.json()["detail"]
+
+
+@pytest.mark.anyio
 async def test_patch_room_settings_rejects_an_unknown_translation_provider():
     """Reject translation providers that have no registered worker implementation."""
 

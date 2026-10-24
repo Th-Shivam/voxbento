@@ -880,7 +880,13 @@ async def _patch_room_settings(
     if transcription_provider_changed or transcription_model_changed or updates.get("floor_transcription_enabled") is True:
         provider_value = updates.get("floor_transcription_provider", room.floor_transcription_provider)
         model_value = updates.get("floor_transcription_model", room.floor_transcription_model)
-        provider = ProviderEnum(getattr(provider_value, "value", provider_value))
+        try:
+            provider = ProviderEnum(getattr(provider_value, "value", provider_value))
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="A valid transcription provider is required for transcription settings",
+            ) from None
         if model_value not in ALLOWED_MODELS[provider]:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
