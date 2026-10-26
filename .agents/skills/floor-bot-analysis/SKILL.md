@@ -63,4 +63,4 @@ If FFmpeg reports loop/sync errors (`Non-monotonous DTS`), check the sample rate
 
 **Check FFmpeg/MediaMTX Streaming:**
 `docker compose logs -f mediamtx`
-*(Look for: `[path {event_slug}/floor] stream is online`)*
+*(Look for: `[path {event_slug}/{room_id}/floor] stream is online`)*
