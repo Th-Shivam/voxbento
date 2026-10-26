@@ -1,6 +1,6 @@
 # VoxBento — Transcription Map
 
-> Derived from `portal/transcription/`. All facts from live implementation.
+> Derived from `portal/transcription/` and `portal/booth_identity.py`. All facts from live implementation.
 
 ---
 
@@ -14,7 +14,7 @@ Active interpreter Go Live
         │
         ▼
    MediaMTX (RTSP port 8554)
-   rtsp://mediamtx:8554/{event_slug}/{language_code}
+   rtsp://mediamtx:8554/{event_slug}/{room_id}/{language_code}
         │
         ▼
    ffmpeg (spawned by transcription worker)
@@ -31,7 +31,7 @@ Jitsi Meet Floor Conference
         │
         ▼
    ffmpeg (spawned by floor-bot)
-   Encodes to Opus → RTSP tcp push to MediaMTX:8554/{event_slug}/floor
+   Encodes to Opus → RTSP tcp push to MediaMTX:8554/{event_slug}/{room_id}/floor
 ```
 
 ### 3. Transcription & Translation Flow
@@ -116,7 +116,7 @@ External provider use requires `event.transcription_api_enabled = True`.
 
 ## Worker Lifecycle
 
-### `start_transcription_worker(event_slug, language_code, booth_id, broadcast_callback, provider, model_size, config)`
+### `start_transcription_worker(event_slug, language_code, booth_id, broadcast_callback, provider, model_size, config, transcription_language=None, room_id=None)`
 
 1. Acquires `active_workers_lock`.
 2. Returns immediately if worker already running for this `booth_id`.
@@ -126,7 +126,7 @@ External provider use requires `event.transcription_api_enabled = True`.
 
 ### `transcription_worker(...)` (internal)
 
-1. Builds RTSP URL: `rtsp://mediamtx:8554/{event_slug}/{language_code}`
+1. Builds the canonical MediaMTX path with `make_mediamtx_path(event_slug, room_id, language_code)` and prefixes it with `settings.mediamtx_rtsp_base`, producing `rtsp://mediamtx:8554/{event_slug}/{room_id}/{language_code}`.
 2. Spawns ffmpeg: PCM s16le 16kHz mono via subprocess pipe.
 3. Starts `stderr_task` to drain ffmpeg stderr (debug log only).
 4. Calls `provider.run_stream(process, ...)` — blocks until stream ends.

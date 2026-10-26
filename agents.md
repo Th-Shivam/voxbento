@@ -93,7 +93,7 @@ VoxBento is a production-grade **browser-first interpretation booth console** fo
 | `portal/static/js/admin.js` | Admin panel JS helpers |
 | `mediamtx.yml` | MediaMTX config — WHIP/WHEP paths, RTSP, Control API, `overridePublisher` |
 | `docker-compose.yml` | portal + mediamtx + jitsi-web/prosody/jicofo/jvb |
-| `alembic/versions/` | 31 migrations (001–031); run `uv run alembic upgrade head` |
+| `alembic/versions/` | 38 migrations (001–038); run `uv run alembic upgrade head` |
 
 ---
 
